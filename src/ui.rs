@@ -335,45 +335,41 @@ fn render_editor_pane(frame: &mut Frame, area: Rect, app: &App) {
             // 检查该行是否被修改（对比原始内容）
             let is_modified = app.editor_original_content.get(actual_line) != Some(&line.to_string());
 
-            // 行号颜色 - 修改的行用绿色显示
-            let _line_num_color = if is_modified {
-                Color::Green
+            // 行号颜色 - 修改的行用绿色或黄色显示
+            let line_num_color = if is_modified {
+                colors::MODIFIED // 使用定义的修改颜色
             } else if is_cursor_line && app.focus == FocusArea::Editor {
                 Color::White
             } else {
                 Color::DarkGray
             };
 
-            // 如果当前行是光标所在行，高亮显示
+            let line_num_span = Span::styled(
+                format!("{:<5} ", line_num),
+                Style::default().fg(line_num_color)
+            );
+
+            // 如果当前行是光标所在行，整行高亮
             if is_cursor_line && app.focus == FocusArea::Editor {
-                let line_chars: Vec<char> = line.chars().collect();
-
-                // 构建带光标的行
-                let mut styled_line = format!("{:<5} ", line_num);
-                for (col, c) in line_chars.iter().enumerate() {
-                    if col == app.editor_cursor.1 {
-                        styled_line.push('▌'); // 光标字符（块状）
-                    }
-                    styled_line.push(*c);
-                }
-                // 如果光标在行尾
-                if app.editor_cursor.1 >= line_chars.len() {
-                    styled_line.push('▌');
-                }
-
-                Line::from(styled_line)
-                    .style(Style::default().bg(Color::DarkGray).fg(Color::White))
+                // 构建带高亮的行
+                Line::from(vec![
+                    line_num_span,
+                    Span::styled(line.to_string(), Style::default().fg(Color::White))
+                ]).style(Style::default().bg(Color::Rgb(40, 40, 60)))
             } else {
-                // 非光标行 - 检查是否修改
-                let line_prefix = format!("{:<5} ", line_num);
+                // 非光标行
                 if is_modified {
-                    // 修改的行用绿色背景
-                    Line::from(line_prefix + line)
-                        .style(Style::default().bg(Color::Rgb(20, 40, 20)).fg(Color::Green))
+                    // 修改的行
+                    Line::from(vec![
+                        line_num_span,
+                        Span::styled(line.to_string(), Style::default().fg(Color::White))
+                    ]).style(Style::default().bg(Color::Rgb(20, 30, 20)))
                 } else {
-                    // 未修改的行正常显示
-                    Line::from(format!("{:<5} {}", line_num, line))
-                        .style(Style::default().fg(if line.is_empty() { Color::DarkGray } else { Color::Gray }))
+                    // 未修改的行
+                    Line::from(vec![
+                        line_num_span,
+                        Span::styled(line.to_string(), Style::default().fg(if line.is_empty() { Color::DarkGray } else { Color::Gray }))
+                    ])
                 }
             }
         })

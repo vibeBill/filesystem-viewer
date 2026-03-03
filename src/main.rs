@@ -67,8 +67,8 @@ fn run(
     app: &mut App,
     change_rx: Option<std::sync::mpsc::Receiver<()>>,
 ) -> Result<()> {
-    // 响应时间（约 50 FPS），提升鼠标 hover 和滚动的丝滑度
-    let refresh_timeout = Duration::from_millis(20);
+    // 响应时间（约 60 FPS），提升鼠标 hover 和滚动的丝滑度
+    let refresh_timeout = Duration::from_millis(16);
 
     loop {
         // 绘制界面
@@ -151,19 +151,19 @@ fn handle_mouse_event(app: &mut App, mouse: MouseEvent) -> bool {
     }
 
     match mouse.kind {
-        // 鼠标滚动 - 根据聚焦区域决定滚动目标（整页滚动）
+        // 鼠标滚动 - 根据聚焦区域决定滚动目标 (逐行滚动提升手感)
         MouseEventKind::ScrollUp => {
             if app.focus == FocusArea::Editor && !app.editor_content.is_empty() {
-                app.editor_page_up();
+                app.editor_scroll_up(2);
             } else {
-                app.page_up();
+                app.scroll_up(2);
             }
         }
         MouseEventKind::ScrollDown => {
             if app.focus == FocusArea::Editor && !app.editor_content.is_empty() {
-                app.editor_page_down();
+                app.editor_scroll_down(2);
             } else {
-                app.page_down();
+                app.scroll_down(2);
             }
         }
         // 鼠标左键点击
@@ -413,15 +413,11 @@ fn handle_editor_event(app: &mut App, key: KeyEvent) -> bool {
 
         // Page Up / Page Down
         KeyCode::PageUp => {
-            for _ in 0..app.list_height {
-                app.editor_up();
-            }
+            app.editor_page_up();
         }
 
         KeyCode::PageDown => {
-            for _ in 0..app.list_height {
-                app.editor_down();
-            }
+            app.editor_page_down();
         }
 
         // Home / End

@@ -654,6 +654,51 @@ impl App {
         }
     }
 
+    /// 向上滚动 (逐行)
+    pub fn scroll_up(&mut self, lines: usize) {
+        for _ in 0..lines {
+            if self.scroll_offset > 0 {
+                self.scroll_offset -= 1;
+            }
+            if self.selected > self.scroll_offset + self.list_height - 1 {
+                self.selected = self.scroll_offset + self.list_height - 1;
+            }
+        }
+    }
+
+    /// 向下滚动 (逐行)
+    pub fn scroll_down(&mut self, lines: usize) {
+        let filtered_len = self.cached_filtered.len();
+        for _ in 0..lines {
+            if self.scroll_offset + self.list_height < filtered_len {
+                self.scroll_offset += 1;
+            }
+            if self.selected < self.scroll_offset {
+                self.selected = self.scroll_offset;
+            }
+        }
+    }
+
+    /// 编辑器向上滚动 (逐行)
+    pub fn editor_scroll_up(&mut self, lines: usize) {
+        if self.editor_scroll >= lines {
+            self.editor_scroll -= lines;
+        } else {
+            self.editor_scroll = 0;
+        }
+    }
+
+    /// 编辑器向下滚动 (逐行)
+    pub fn editor_scroll_down(&mut self, lines: usize) {
+        let visible_lines = self.list_height.max(10);
+        let max_scroll = self.editor_content.len().saturating_sub(visible_lines);
+        if self.editor_scroll + lines <= max_scroll {
+            self.editor_scroll += lines;
+        } else {
+            self.editor_scroll = max_scroll;
+        }
+    }
+
     /// 处理鼠标点击事件
     pub fn handle_mouse_click(&mut self, row: u16, column: u16, kind: MouseEventKind) -> bool {
         // 更新 hover 位置
@@ -684,9 +729,15 @@ impl App {
                         let actual_index = self.scroll_offset + item_rel_index;
 
                         if actual_index < self.cached_filtered.len() {
-                            // 如果点击的是已经选中的项，则切换折叠（模拟 VSCode 单击选中/切换）
+                            // 如果点击的是已经选中的项，或是文件，则尝试进入编辑模式
                             if self.selected == actual_index {
-                                self.toggle_collapse();
+                                if let Some(file) = self.get_file_by_index(actual_index) {
+                                    if file.is_dir {
+                                        self.toggle_collapse();
+                                    } else {
+                                        let _ = self.open_editor();
+                                    }
+                                }
                             } else {
                                 self.selected = actual_index;
                             }
@@ -712,15 +763,22 @@ impl App {
     }
 
     /// 处理编辑器鼠标点击（设置光标位置）
-    fn editor_mouse_click(&mut self, row: u16, _column: u16) {
+    fn editor_mouse_click(&mut self, row: u16, column: u16) {
         if let Some(editor_area) = self.editor_area {
-            if row >= editor_area.y && row < editor_area.y + editor_area.height {
-                let line_offset = (row - editor_area.y) as usize;
+            // 检查行
+            if row >= editor_area.y + 1 && row < editor_area.y + editor_area.height - 1 {
+                let line_offset = (row - (editor_area.y + 1)) as usize;
                 let new_line = (self.editor_scroll + line_offset).min(self.editor_content.len().saturating_sub(1));
                 self.editor_cursor.0 = new_line;
-                // 列位置保持或设置为行尾
-                if self.editor_cursor.1 > self.editor_content.get(new_line).map(|s| s.chars().count()).unwrap_or(0) {
-                    self.editor_cursor.1 = self.editor_content.get(new_line).map(|s| s.chars().count()).unwrap_or(0);
+
+                // 计算列：减去边框(1)和行号区(5)
+                let text_start_x = editor_area.x + 6;
+                if column >= text_start_x {
+                    let col_offset = (column - text_start_x) as usize;
+                    let line_len = self.editor_content.get(new_line).map(|s| s.chars().count()).unwrap_or(0);
+                    self.editor_cursor.1 = col_offset.min(line_len);
+                } else {
+                    self.editor_cursor.1 = 0;
                 }
             }
         }
