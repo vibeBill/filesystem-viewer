@@ -775,6 +775,18 @@ impl App {
             return;
         }
 
+        if is_known_interactive_command(&command_text) {
+            tab.output.push(format!("> {}", command_text));
+            tab.output
+                .push("[提示] 当前内置终端为非 PTY 模式，无法直接进入交互式会话。".to_string());
+            tab.output.push(
+                "请改用非交互方式，例如：claude --print \"你的问题\" 或 echo \"你的问题\" | claude --print".to_string(),
+            );
+            tab.input.clear();
+            self.terminal_scroll = tab.output.len().saturating_sub(1);
+            return;
+        }
+
         tab.output.push(format!("> {}", command_text));
         tab.input.clear();
         self.terminal_scroll = tab.output.len().saturating_sub(1);
@@ -1173,6 +1185,7 @@ fn run_shell_command_streaming(
         .current_dir(working_dir)
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
+        .stdin(Stdio::null())
         .spawn();
 
     let mut child = match child_result {
@@ -1296,6 +1309,11 @@ fn run_shell_command_streaming(
 fn is_terminal_clear_command(command: &str) -> bool {
     let normalized = command.trim();
     normalized.eq_ignore_ascii_case("clear") || normalized.eq_ignore_ascii_case("cls")
+}
+
+fn is_known_interactive_command(command: &str) -> bool {
+    let normalized = command.trim();
+    matches!(normalized, "claude" | "codex")
 }
 
 fn strip_ansi_control_sequences(input: &str) -> String {
@@ -1475,6 +1493,21 @@ mod tests {
         let tab = &app.terminal_tabs[app.active_terminal_tab];
         assert_eq!(tab.output.len(), 1);
         assert!(tab.output[0].contains("输出已清空"));
+        assert!(tab.running_pid.is_none());
+
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn known_interactive_command_shows_non_pty_hint() {
+        let dir = create_test_dir("interactive-hint");
+        let mut app = App::new(dir.to_string_lossy().as_ref()).expect("app should init");
+
+        app.terminal_tabs[app.active_terminal_tab].input = "claude".to_string();
+        app.terminal_execute();
+
+        let tab = &app.terminal_tabs[app.active_terminal_tab];
+        assert!(tab.output.iter().any(|line| line.contains("非 PTY 模式")));
         assert!(tab.running_pid.is_none());
 
         let _ = fs::remove_dir_all(dir);
