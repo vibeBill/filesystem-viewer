@@ -292,15 +292,6 @@ fn render_terminal_pane(frame: &mut Frame, area: Rect, app: &App) {
     );
 
     frame.render_widget(terminal, area);
-
-    if app.focus == FocusArea::Terminal {
-        let prompt_width = UnicodeWidthStr::width("> ") as u16;
-        let input_width = UnicodeWidthStr::width(tab.input.as_str()) as u16;
-        let max_x = area.x + area.width.saturating_sub(2);
-        let cursor_x = (area.x + 1 + prompt_width + input_width).min(max_x);
-        let cursor_y = area.y + area.height.saturating_sub(2);
-        frame.set_cursor_position((cursor_x, cursor_y));
-    }
 }
 
 /// 渲染状态栏
