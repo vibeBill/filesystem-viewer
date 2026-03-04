@@ -170,9 +170,17 @@ fn handle_mouse_event(app: &mut App, mouse: MouseEvent) -> bool {
         MouseEventKind::Down(MouseButton::Left) => {
             app.handle_mouse_click(mouse.row, mouse.column, MouseEventKind::Down(MouseButton::Left));
         }
-        // 鼠标中键点击 - 整页滚动
+        // 鼠标中键点击 - 开始拖拽滚动
         MouseEventKind::Down(MouseButton::Middle) => {
             app.handle_mouse_click(mouse.row, mouse.column, MouseEventKind::Down(MouseButton::Middle));
+        }
+        // 鼠标中键拖拽 - 自由滚动
+        MouseEventKind::Drag(MouseButton::Middle) => {
+            app.handle_middle_drag(mouse.row, mouse.column);
+        }
+        // 鼠标中键释放 - 停止拖拽
+        MouseEventKind::Up(MouseButton::Middle) => {
+            app.stop_middle_drag();
         }
         _ => {}
     }

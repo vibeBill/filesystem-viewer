@@ -17,6 +17,8 @@ notify = "7.0"
 anyhow = "1.0"
 # 时间处理
 chrono = "0.4"
+# Unicode 宽度计算（光标定位）
+unicode-width = "0.2"
 
 [profile.release]
 lto = true

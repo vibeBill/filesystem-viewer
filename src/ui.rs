@@ -4,9 +4,10 @@ use ratatui::{
     Frame,
 };
 use crate::app::{App, AppState, DisplayMode, FocusArea, AppMode};
-use crate::git::GitStatus;
+use crate::git::{GitStatus, DiffLineType};
 use std::path::Path;
 use std::process::Command;
+use unicode_width::UnicodeWidthStr;
 
 /// 颜色定义
 mod colors {
@@ -17,6 +18,7 @@ mod colors {
     pub const DELETED: Color = Color::Red;
     pub const UNTRACKED: Color = Color::Gray;
     pub const RENAMED: Color = Color::Magenta;
+    pub const IGNORED: Color = Color::Rgb(100, 100, 100);
     pub const CLEAN: Color = Color::White;
     pub const HEADER_BG: Color = Color::Blue;
     pub const HELP_BG: Color = Color::Black;
@@ -156,6 +158,7 @@ fn render_file_list(frame: &mut Frame, area: Rect, app: &App) {
                 GitStatus::Deleted => colors::DELETED,
                 GitStatus::Untracked => colors::UNTRACKED,
                 GitStatus::Renamed => colors::RENAMED,
+                GitStatus::Ignored => colors::IGNORED,
                 GitStatus::Clean => colors::CLEAN,
                 _ => colors::CLEAN,
             };
@@ -309,19 +312,15 @@ fn render_editor_pane(frame: &mut Frame, area: Rect, app: &App) {
     // 计算可见行数（减去上下边框）
     let inner_height = area.height.saturating_sub(2) as usize;
 
-    // 确保光标在可见范围内
+    // 使用 app 的 editor_scroll，不强制跟随光标
+    // 光标移动时的滚动调整已在 editor_up/editor_down 等方法中处理
     let mut editor_scroll = app.editor_scroll;
-    if app.editor_cursor.0 < editor_scroll {
-        editor_scroll = app.editor_cursor.0;
-    } else if app.editor_cursor.0 >= editor_scroll + inner_height {
-        editor_scroll = app.editor_cursor.0 - inner_height + 1;
-    }
-    // 确保不超过底部
+    // 仅确保不超过底部
     if editor_scroll + inner_height > app.editor_content.len() {
         editor_scroll = app.editor_content.len().saturating_sub(inner_height);
     }
 
-    // 渲染编辑器内容（带光标和 diff 高亮）
+    // 渲染编辑器内容（带光标、diff 高亮和 VSCode 风格 gutter 标记）
     let lines: Vec<Line> = app.editor_content
         .iter()
         .skip(editor_scroll)
@@ -332,46 +331,69 @@ fn render_editor_pane(frame: &mut Frame, area: Rect, app: &App) {
             let actual_line = i + editor_scroll;
             let is_cursor_line = actual_line == app.editor_cursor.0;
 
-            // 检查该行是否被修改（对比原始内容）
-            let is_modified = app.editor_original_content.get(actual_line) != Some(&line.to_string());
+            // 检查该行是否有 git diff 标记
+            let diff_type = app.editor_diff_lines.get(&line_num);
 
-            // 行号颜色 - 修改的行用绿色或黄色显示
-            let line_num_color = if is_modified {
-                colors::MODIFIED // 使用定义的修改颜色
+            // 检查该行是否被编辑修改（对比原始内容）
+            let is_edited = app.editor_original_content.get(actual_line) != Some(&line.to_string());
+
+            // Gutter 标记（VSCode 风格）
+            let (gutter_char, gutter_color) = match diff_type {
+                Some(DiffLineType::Added) => ("┃", Color::Green),
+                Some(DiffLineType::Modified) => ("┃", Color::Rgb(80, 130, 220)),
+                Some(DiffLineType::Deleted) => ("▸", Color::Red),
+                None => {
+                    if is_edited {
+                        ("┃", Color::Yellow)
+                    } else {
+                        (" ", Color::DarkGray)
+                    }
+                }
+            };
+
+            // 行号颜色
+            let line_num_color = if diff_type.is_some() || is_edited {
+                gutter_color
             } else if is_cursor_line && app.focus == FocusArea::Editor {
                 Color::White
             } else {
                 Color::DarkGray
             };
 
+            let gutter_span = Span::styled(
+                gutter_char.to_string(),
+                Style::default().fg(gutter_color)
+            );
+
             let line_num_span = Span::styled(
-                format!("{:<5} ", line_num),
+                format!("{:<4} ", line_num),
                 Style::default().fg(line_num_color)
             );
 
-            // 如果当前行是光标所在行，整行高亮
-            if is_cursor_line && app.focus == FocusArea::Editor {
-                // 构建带高亮的行
-                Line::from(vec![
-                    line_num_span,
-                    Span::styled(line.to_string(), Style::default().fg(Color::White))
-                ]).style(Style::default().bg(Color::Rgb(40, 40, 60)))
+            // 行背景色
+            let line_bg = if is_cursor_line && app.focus == FocusArea::Editor {
+                Color::Rgb(40, 40, 60)
+            } else if diff_type == Some(&DiffLineType::Added) {
+                Color::Rgb(15, 30, 15)
+            } else if diff_type == Some(&DiffLineType::Modified) || is_edited {
+                Color::Rgb(20, 25, 35)
             } else {
-                // 非光标行
-                if is_modified {
-                    // 修改的行
-                    Line::from(vec![
-                        line_num_span,
-                        Span::styled(line.to_string(), Style::default().fg(Color::White))
-                    ]).style(Style::default().bg(Color::Rgb(20, 30, 20)))
-                } else {
-                    // 未修改的行
-                    Line::from(vec![
-                        line_num_span,
-                        Span::styled(line.to_string(), Style::default().fg(if line.is_empty() { Color::DarkGray } else { Color::Gray }))
-                    ])
-                }
-            }
+                Color::Reset
+            };
+
+            let text_color = if is_cursor_line && app.focus == FocusArea::Editor {
+                Color::White
+            } else if line.is_empty() {
+                Color::DarkGray
+            } else {
+                Color::Gray
+            };
+
+            Line::from(vec![
+                gutter_span,
+                line_num_span,
+                Span::styled(line.to_string(), Style::default().fg(text_color))
+            ]).style(Style::default().bg(line_bg))
         })
         .collect();
 
@@ -388,8 +410,15 @@ fn render_editor_pane(frame: &mut Frame, area: Rect, app: &App) {
 
     // 如果聚焦在编辑器，显示光标
     if app.focus == FocusArea::Editor {
+        // 计算光标前文本的实际显示宽度（支持中文等宽字符）
+        let cursor_display_offset = if let Some(line) = app.editor_content.get(app.editor_cursor.0) {
+            let prefix: String = line.chars().take(app.editor_cursor.1).collect();
+            UnicodeWidthStr::width(prefix.as_str()) as u16
+        } else {
+            0
+        };
         frame.set_cursor_position((
-            area.x + 6 + app.editor_cursor.1 as u16, // 6 = 行号 4 位 + 空格 1 + 边框 1
+            area.x + 1 + 1 + 5 + cursor_display_offset, // 边框 1 + gutter 1 + 行号 4 + 空格 1 = 7
             area.y + 1 + (app.editor_cursor.0 - editor_scroll) as u16,
         ));
     }
