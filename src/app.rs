@@ -766,27 +766,6 @@ impl App {
             return;
         }
 
-        if is_terminal_clear_command(&command_text) {
-            tab.output.clear();
-            tab.output
-                .push("[终端] 输出已清空（拦截 clear/cls，避免清屏控制序列影响 TUI）".to_string());
-            tab.input.clear();
-            self.terminal_scroll = tab.output.len().saturating_sub(1);
-            return;
-        }
-
-        if is_known_interactive_command(&command_text) {
-            tab.output.push(format!("> {}", command_text));
-            tab.output
-                .push("[提示] 当前内置终端为非 PTY 模式，无法直接进入交互式会话。".to_string());
-            tab.output.push(
-                "请改用非交互方式，例如：claude --print \"你的问题\" 或 echo \"你的问题\" | claude --print".to_string(),
-            );
-            tab.input.clear();
-            self.terminal_scroll = tab.output.len().saturating_sub(1);
-            return;
-        }
-
         tab.output.push(format!("> {}", command_text));
         tab.input.clear();
         self.terminal_scroll = tab.output.len().saturating_sub(1);
@@ -809,9 +788,7 @@ impl App {
                     tab.running_pid = Some(pid);
                     tab.output.push(format!("[进程已启动 pid={}]", pid));
                 }
-                TerminalCommandEvent::Line(line) => {
-                    tab.output.push(strip_ansi_control_sequences(&line))
-                }
+                TerminalCommandEvent::Line(line) => tab.output.push(line),
                 TerminalCommandEvent::Error(err) => tab.output.push(format!("[错误] {}", err)),
                 TerminalCommandEvent::Finished => {
                     tab.running_pid = None;
@@ -1185,7 +1162,6 @@ fn run_shell_command_streaming(
         .current_dir(working_dir)
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
-        .stdin(Stdio::null())
         .spawn();
 
     let mut child = match child_result {
@@ -1306,58 +1282,6 @@ fn run_shell_command_streaming(
     send_terminal_event(sender, tab_index, TerminalCommandEvent::Finished);
 }
 
-fn is_terminal_clear_command(command: &str) -> bool {
-    let normalized = command.trim();
-    normalized.eq_ignore_ascii_case("clear") || normalized.eq_ignore_ascii_case("cls")
-}
-
-fn is_known_interactive_command(command: &str) -> bool {
-    let normalized = command.trim();
-    matches!(normalized, "claude" | "codex")
-}
-
-fn strip_ansi_control_sequences(input: &str) -> String {
-    let mut result = String::with_capacity(input.len());
-    let mut chars = input.chars().peekable();
-
-    while let Some(ch) = chars.next() {
-        if ch == '\u{1b}' {
-            match chars.peek().copied() {
-                Some('[') => {
-                    chars.next();
-                    while let Some(next) = chars.next() {
-                        if ('@'..='~').contains(&next) {
-                            break;
-                        }
-                    }
-                }
-                Some(']') => {
-                    chars.next();
-                    while let Some(next) = chars.next() {
-                        if next == '\u{7}' {
-                            break;
-                        }
-                        if next == '\u{1b}' && chars.peek() == Some(&'\\') {
-                            chars.next();
-                            break;
-                        }
-                    }
-                }
-                _ => {}
-            }
-            continue;
-        }
-
-        if ch.is_control() && ch != '\t' {
-            continue;
-        }
-
-        result.push(ch);
-    }
-
-    result
-}
-
 fn extract_links(line: &str) -> Vec<(usize, usize, String)> {
     let mut result = Vec::new();
     let mut in_token = false;
@@ -1461,62 +1385,6 @@ fn shell_command(command: &str) -> (&'static str, Vec<String>) {
     #[cfg(not(target_os = "windows"))]
     {
         ("bash", vec!["-lc".to_string(), command.to_string()])
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use std::fs;
-    use std::path::PathBuf;
-    use std::time::{SystemTime, UNIX_EPOCH};
-
-    fn create_test_dir(name: &str) -> PathBuf {
-        let nanos = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_nanos();
-        let mut dir = std::env::temp_dir();
-        dir.push(format!("fsv-app-{}-{}", name, nanos));
-        fs::create_dir_all(&dir).expect("failed to create test directory");
-        dir
-    }
-
-    #[test]
-    fn clear_command_is_handled_inside_terminal_pane() {
-        let dir = create_test_dir("clear");
-        let mut app = App::new(dir.to_string_lossy().as_ref()).expect("app should init");
-
-        app.terminal_tabs[app.active_terminal_tab].input = "clear".to_string();
-        app.terminal_execute();
-
-        let tab = &app.terminal_tabs[app.active_terminal_tab];
-        assert_eq!(tab.output.len(), 1);
-        assert!(tab.output[0].contains("输出已清空"));
-        assert!(tab.running_pid.is_none());
-
-        let _ = fs::remove_dir_all(dir);
-    }
-
-    #[test]
-    fn known_interactive_command_shows_non_pty_hint() {
-        let dir = create_test_dir("interactive-hint");
-        let mut app = App::new(dir.to_string_lossy().as_ref()).expect("app should init");
-
-        app.terminal_tabs[app.active_terminal_tab].input = "claude".to_string();
-        app.terminal_execute();
-
-        let tab = &app.terminal_tabs[app.active_terminal_tab];
-        assert!(tab.output.iter().any(|line| line.contains("非 PTY 模式")));
-        assert!(tab.running_pid.is_none());
-
-        let _ = fs::remove_dir_all(dir);
-    }
-
-    #[test]
-    fn strip_ansi_control_sequences_removes_clear_escape_codes() {
-        let input = "before\u{1b}[2J\u{1b}[Hafter";
-        assert_eq!(strip_ansi_control_sequences(input), "beforeafter");
     }
 }
 
