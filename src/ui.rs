@@ -1,10 +1,6 @@
-use ratatui::{
-    prelude::*,
-    widgets::*,
-    Frame,
-};
-use crate::app::{App, AppState, DisplayMode, FocusArea, AppMode};
-use crate::git::{GitStatus, DiffLineType};
+use crate::app::{App, AppMode, AppState, DisplayMode, FocusArea};
+use crate::git::{DiffLineType, GitStatus};
+use ratatui::{prelude::*, widgets::*, Frame};
 use std::path::Path;
 use std::process::Command;
 use unicode_width::UnicodeWidthStr;
@@ -40,9 +36,9 @@ fn render_main_view(frame: &mut Frame, app: &mut App) {
     let chunks = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
-            Constraint::Length(3),  // 头部
-            Constraint::Min(0),     // 主内容
-            Constraint::Length(3),  // 状态栏
+            Constraint::Length(3), // 头部
+            Constraint::Min(0),    // 主内容
+            Constraint::Length(3), // 状态栏
         ])
         .split(frame.area());
 
@@ -56,8 +52,8 @@ fn render_main_view(frame: &mut Frame, app: &mut App) {
     let main_chunks = Layout::default()
         .direction(Direction::Horizontal)
         .constraints([
-            Constraint::Length(app.tree_width as u16),  // 左侧目录树
-            Constraint::Min(0),                         // 右侧预览/编辑器
+            Constraint::Length(app.tree_width as u16), // 左侧目录树
+            Constraint::Min(0),                        // 右侧预览/编辑器
         ])
         .split(chunks[1]);
 
@@ -65,7 +61,7 @@ fn render_main_view(frame: &mut Frame, app: &mut App) {
     app.set_editor_area(main_chunks[1]);
 
     render_file_list(frame, main_chunks[0], app);
-    render_editor_pane(frame, main_chunks[1], app);  // 直接渲染编辑器窗格
+    render_editor_pane(frame, main_chunks[1], app); // 直接渲染编辑器窗格
     render_status_bar(frame, chunks[2], app);
 
     // 如果显示搜索，覆盖显示搜索框
@@ -97,9 +93,7 @@ fn render_header(frame: &mut Frame, area: Rect, app: &App) {
     };
 
     let header = Paragraph::new(format!(" {} - {}", git_status, app.working_dir))
-        .style(Style::default()
-            .fg(Color::White)
-            .bg(colors::HEADER_BG))
+        .style(Style::default().fg(Color::White).bg(colors::HEADER_BG))
         .alignment(Alignment::Center);
 
     frame.render_widget(header, area);
@@ -125,7 +119,7 @@ fn render_file_list(frame: &mut Frame, area: Rect, app: &App) {
 
     // 计算可见区域高度（减去上下边框）
     let inner_height = area.height.saturating_sub(2) as usize;
-    
+
     // 只处理可见的文件项，大幅提升高性能大数据量下的响应速度
     let visible_items: Vec<ListItem> = filtered
         .iter()
@@ -137,17 +131,18 @@ fn render_file_list(frame: &mut Frame, area: Rect, app: &App) {
 
             // 检查是否是 hover 的行
             let is_hovered = if let (Some(h_row), Some(h_col)) = (app.hover_row, app.hover_col) {
-                h_col >= area.x && h_col < area.x + area.width
+                h_col >= area.x
+                    && h_col < area.x + area.width
                     && h_row == area.y + 1 + (idx as i16 - app.scroll_offset as i16) as u16
             } else {
                 false
             };
 
             // 获取文件信息
-            let file = app.files.iter().find(|f| f.path == *path);
-            let (status, is_dir, depth) = file
-                .map(|f| (f.status, f.is_dir, f.depth))
-                .unwrap_or((GitStatus::Clean, false, 0));
+            let file = app.get_file_by_path(path);
+            let (status, is_dir, depth) =
+                file.map(|f| (f.status, f.is_dir, f.depth))
+                    .unwrap_or((GitStatus::Clean, false, 0));
 
             let indent = "  ".repeat(depth);
 
@@ -179,23 +174,41 @@ fn render_file_list(frame: &mut Frame, area: Rect, app: &App) {
             // 如果没有图标字体支持，回退到普通字符
             let fold_icon = if fold_icon.chars().any(|c| c as u32 > 0x7F) {
                 if is_dir {
-                    if app.is_collapsed(path) { "▶ " } else { "▼ " }
-                } else { "  " }
+                    if app.is_collapsed(path) {
+                        "▶ "
+                    } else {
+                        "▼ "
+                    }
+                } else {
+                    "  "
+                }
             } else {
                 fold_icon
             };
 
-            let file_name = path.rsplit(|c| c == '/' || c == '\\').next().unwrap_or(path);
-            let display_name = if is_dir { format!("{}/", file_name) } else { file_name.to_string() };
+            let file_name = path
+                .rsplit(|c| c == '/' || c == '\\')
+                .next()
+                .unwrap_or(path);
+            let display_name = if is_dir {
+                format!("{}/", file_name)
+            } else {
+                file_name.to_string()
+            };
 
-            let content = format!("{}{} {:<2} {}", indent, fold_icon, status_symbol, display_name);
+            let content = format!(
+                "{}{} {:<2} {}",
+                indent, fold_icon, status_symbol, display_name
+            );
 
             // 样式优化
             let mut style = Style::default().fg(status_color);
-            
+
             if is_selected {
                 if app.focus == FocusArea::Tree {
-                    style = style.bg(Color::Rgb(50, 50, 80)).add_modifier(Modifier::BOLD);
+                    style = style
+                        .bg(Color::Rgb(50, 50, 80))
+                        .add_modifier(Modifier::BOLD);
                 } else {
                     style = style.bg(Color::Rgb(40, 40, 40));
                 }
@@ -215,11 +228,15 @@ fn render_file_list(frame: &mut Frame, area: Rect, app: &App) {
         Style::default().fg(Color::DarkGray)
     };
 
-    let list = List::new(visible_items)
-        .block(Block::default()
+    let list = List::new(visible_items).block(
+        Block::default()
             .borders(Borders::ALL)
-            .title(Span::styled(tree_title, Style::default().add_modifier(Modifier::BOLD)))
-            .border_style(border_style));
+            .title(Span::styled(
+                tree_title,
+                Style::default().add_modifier(Modifier::BOLD),
+            ))
+            .border_style(border_style),
+    );
 
     frame.render_widget(list, area);
 }
@@ -235,14 +252,21 @@ fn render_status_bar(frame: &mut Frame, area: Rect, app: &App) {
     };
 
     // 获取当前选中文件的简要信息
-    let file_info = app.selected_file().map(|f| {
-        let name = f.path.rsplit(|c| c == '/' || c == '\\').next().unwrap_or(&f.path);
-        if f.is_dir {
-            format!("📁 {}/", name)
-        } else {
-            format!("📄 {}", name)
-        }
-    }).unwrap_or_else(|| "无文件".to_string());
+    let file_info = app
+        .selected_file()
+        .map(|f| {
+            let name = f
+                .path
+                .rsplit(|c| c == '/' || c == '\\')
+                .next()
+                .unwrap_or(&f.path);
+            if f.is_dir {
+                format!("📁 {}/", name)
+            } else {
+                format!("📄 {}", name)
+            }
+        })
+        .unwrap_or_else(|| "无文件".to_string());
 
     // 状态栏分三部分：左侧 Git 统计，中间当前文件，右侧快捷键提示
     let stats_text = format!(
@@ -267,7 +291,10 @@ fn render_status_bar(frame: &mut Frame, area: Rect, app: &App) {
     // 中间文件信息
     let max_file_width = area.width.saturating_sub(stats_width + shortcuts_width + 4);
     let file_display = if file_info.len() > max_file_width as usize {
-        format!("{}...", &file_info[..max_file_width.saturating_sub(3) as usize])
+        format!(
+            "{}...",
+            &file_info[..max_file_width.saturating_sub(3) as usize]
+        )
     } else {
         file_info
     };
@@ -275,9 +302,7 @@ fn render_status_bar(frame: &mut Frame, area: Rect, app: &App) {
     let status_line = format!("{} {} {}", stats_text, file_display, shortcuts_text);
 
     let status_bar = Paragraph::new(status_line)
-        .style(Style::default()
-            .fg(Color::White)
-            .bg(Color::DarkGray))
+        .style(Style::default().fg(Color::White).bg(Color::DarkGray))
         .alignment(Alignment::Left);
 
     frame.render_widget(status_bar, area);
@@ -294,17 +319,28 @@ fn render_editor_pane(frame: &mut Frame, area: Rect, app: &App) {
 
     // 有打开的文件，显示编辑器
     let modified_flag = if app.editor_modified { " *" } else { "" };
-    let save_hint = if app.editor_modified { " (Ctrl+S 保存)" } else { "" };
+    let save_hint = if app.editor_modified {
+        " (Ctrl+S 保存)"
+    } else {
+        ""
+    };
 
     // 编辑器标题 - 显示聚焦状态
     let editor_title = if app.focus == FocusArea::Editor {
-        format!(" 编辑器：{}{}{} ", app.editor_path, modified_flag, save_hint)
+        format!(
+            " 编辑器：{}{}{} ",
+            app.editor_path, modified_flag, save_hint
+        )
     } else {
         format!(" 编辑器：{}{} ", app.editor_path, modified_flag)
     };
 
     let border_color = if app.focus == FocusArea::Editor {
-        if app.editor_modified { Color::Red } else { Color::Yellow }
+        if app.editor_modified {
+            Color::Red
+        } else {
+            Color::Yellow
+        }
     } else {
         Color::Green
     };
@@ -321,7 +357,8 @@ fn render_editor_pane(frame: &mut Frame, area: Rect, app: &App) {
     }
 
     // 渲染编辑器内容（带光标、diff 高亮和 VSCode 风格 gutter 标记）
-    let lines: Vec<Line> = app.editor_content
+    let lines: Vec<Line> = app
+        .editor_content
         .iter()
         .skip(editor_scroll)
         .take(inner_height)
@@ -360,14 +397,12 @@ fn render_editor_pane(frame: &mut Frame, area: Rect, app: &App) {
                 Color::DarkGray
             };
 
-            let gutter_span = Span::styled(
-                gutter_char.to_string(),
-                Style::default().fg(gutter_color)
-            );
+            let gutter_span =
+                Span::styled(gutter_char.to_string(), Style::default().fg(gutter_color));
 
             let line_num_span = Span::styled(
                 format!("{:<4} ", line_num),
-                Style::default().fg(line_num_color)
+                Style::default().fg(line_num_color),
             );
 
             // 行背景色
@@ -392,26 +427,28 @@ fn render_editor_pane(frame: &mut Frame, area: Rect, app: &App) {
             Line::from(vec![
                 gutter_span,
                 line_num_span,
-                Span::styled(line.to_string(), Style::default().fg(text_color))
-            ]).style(Style::default().bg(line_bg))
+                Span::styled(line.to_string(), Style::default().fg(text_color)),
+            ])
+            .style(Style::default().bg(line_bg))
         })
         .collect();
 
     let editor = Paragraph::new(lines)
-        .style(Style::default()
-            .fg(Color::Gray)
-            .bg(colors::EDITOR_BG))
-        .block(Block::default()
-            .borders(Borders::ALL)
-            .title(editor_title)
-            .border_style(Style::default().fg(border_color)));
+        .style(Style::default().fg(Color::Gray).bg(colors::EDITOR_BG))
+        .block(
+            Block::default()
+                .borders(Borders::ALL)
+                .title(editor_title)
+                .border_style(Style::default().fg(border_color)),
+        );
 
     frame.render_widget(editor, area);
 
     // 如果聚焦在编辑器，显示光标
     if app.focus == FocusArea::Editor {
         // 计算光标前文本的实际显示宽度（支持中文等宽字符）
-        let cursor_display_offset = if let Some(line) = app.editor_content.get(app.editor_cursor.0) {
+        let cursor_display_offset = if let Some(line) = app.editor_content.get(app.editor_cursor.0)
+        {
             let prefix: String = line.chars().take(app.editor_cursor.1).collect();
             UnicodeWidthStr::width(prefix.as_str()) as u16
         } else {
@@ -429,7 +466,9 @@ fn render_preview_pane_inner(frame: &mut Frame, area: Rect, app: &App) {
     if let Some(file) = app.selected_file() {
         if file.is_dir {
             // 目录 - 显示目录信息
-            let dir_children = app.files.iter()
+            let dir_children = app
+                .files
+                .iter()
                 .filter(|f| f.path.starts_with(&file.path) && f.path != file.path)
                 .count();
 
@@ -443,10 +482,12 @@ fn render_preview_pane_inner(frame: &mut Frame, area: Rect, app: &App) {
             ];
             let preview = Paragraph::new(dir_info)
                 .style(Style::default().fg(Color::Gray))
-                .block(Block::default()
-                    .title(" 目录预览 ")
-                    .borders(Borders::ALL)
-                    .border_style(Style::default().fg(Color::Cyan)));
+                .block(
+                    Block::default()
+                        .title(" 目录预览 ")
+                        .borders(Borders::ALL)
+                        .border_style(Style::default().fg(Color::Cyan)),
+                );
             frame.render_widget(preview, area);
         } else {
             // 文件 - 显示文件内容预览
@@ -474,8 +515,16 @@ fn render_preview_pane_inner(frame: &mut Frame, area: Rect, app: &App) {
 
             // 构建预览内容（带文件信息头部）
             let mut lines: Vec<Line> = vec![
-                Line::from(format!(" 📄 {} ", file.path).bg(Color::DarkGray).fg(Color::White)),
-                Line::from(format!(" 状态：{} | 大小：{} 行", status_desc, content.lines().count())),
+                Line::from(
+                    format!(" 📄 {} ", file.path)
+                        .bg(Color::DarkGray)
+                        .fg(Color::White),
+                ),
+                Line::from(format!(
+                    " 状态：{} | 大小：{} 行",
+                    status_desc,
+                    content.lines().count()
+                )),
                 Line::from(""),
             ];
 
@@ -492,22 +541,24 @@ fn render_preview_pane_inner(frame: &mut Frame, area: Rect, app: &App) {
                     // 修改的行用黄色高亮
                     lines.push(
                         Line::from(format!("{:<4} {}", line_num, line))
-                            .style(Style::default().bg(Color::Rgb(40, 35, 0)).fg(Color::Yellow))
+                            .style(Style::default().bg(Color::Rgb(40, 35, 0)).fg(Color::Yellow)),
                     );
                 } else {
                     lines.push(
                         Line::from(format!("{:<4} {}", line_num, line))
-                            .style(Style::default().fg(Color::Gray))
+                            .style(Style::default().fg(Color::Gray)),
                     );
                 }
             }
 
             let preview = Paragraph::new(lines)
                 .style(Style::default().bg(colors::EDITOR_BG))
-                .block(Block::default()
-                    .title(format!(" 预览：{} ", file.path))
-                    .borders(Borders::ALL)
-                    .border_style(Style::default().fg(Color::Green)));
+                .block(
+                    Block::default()
+                        .title(format!(" 预览：{} ", file.path))
+                        .borders(Borders::ALL)
+                        .border_style(Style::default().fg(Color::Green)),
+                );
             frame.render_widget(preview, area);
         }
     } else {
@@ -577,13 +628,13 @@ fn render_help(frame: &mut Frame) {
     ];
 
     let help = Paragraph::new(help_text)
-        .style(Style::default()
-            .fg(Color::White)
-            .bg(colors::HELP_BG))
-        .block(Block::default()
-            .title(" 帮助 - 按 ? 关闭 ")
-            .borders(Borders::ALL)
-            .border_style(Style::default().fg(Color::Yellow)))
+        .style(Style::default().fg(Color::White).bg(colors::HELP_BG))
+        .block(
+            Block::default()
+                .title(" 帮助 - 按 ? 关闭 ")
+                .borders(Borders::ALL)
+                .border_style(Style::default().fg(Color::Yellow)),
+        )
         .alignment(Alignment::Left);
 
     frame.render_widget(Clear, area);
@@ -603,13 +654,13 @@ fn render_error(frame: &mut Frame, app: &App) {
     ];
 
     let error = Paragraph::new(error_text)
-        .style(Style::default()
-            .fg(Color::Red)
-            .bg(Color::Black))
-        .block(Block::default()
-            .title(" 错误 ")
-            .borders(Borders::ALL)
-            .border_style(Style::default().fg(Color::Red)))
+        .style(Style::default().fg(Color::Red).bg(Color::Black))
+        .block(
+            Block::default()
+                .title(" 错误 ")
+                .borders(Borders::ALL)
+                .border_style(Style::default().fg(Color::Red)),
+        )
         .alignment(Alignment::Left);
 
     frame.render_widget(Clear, area);
@@ -635,13 +686,13 @@ fn render_status_message(frame: &mut Frame, app: &App) {
         ];
 
         let msg_widget = Paragraph::new(msg_text)
-            .style(Style::default()
-                .fg(Color::Green)
-                .bg(Color::Black))
-            .block(Block::default()
-                .title(" 提示 ")
-                .borders(Borders::ALL)
-                .border_style(Style::default().fg(Color::Green)))
+            .style(Style::default().fg(Color::Green).bg(Color::Black))
+            .block(
+                Block::default()
+                    .title(" 提示 ")
+                    .borders(Borders::ALL)
+                    .border_style(Style::default().fg(Color::Green)),
+            )
             .alignment(Alignment::Center);
 
         frame.render_widget(Clear, area);
@@ -661,23 +712,20 @@ fn render_search_box(frame: &mut Frame, app: &App) {
     ];
 
     let search_widget = Paragraph::new(search_text)
-        .style(Style::default()
-            .fg(Color::Cyan)
-            .bg(Color::Black))
-        .block(Block::default()
-            .title(" 搜索文件 ")
-            .borders(Borders::ALL)
-            .border_style(Style::default().fg(Color::Cyan)))
+        .style(Style::default().fg(Color::Cyan).bg(Color::Black))
+        .block(
+            Block::default()
+                .title(" 搜索文件 ")
+                .borders(Borders::ALL)
+                .border_style(Style::default().fg(Color::Cyan)),
+        )
         .alignment(Alignment::Left);
 
     frame.render_widget(Clear, area);
     frame.render_widget(search_widget, area);
 
     // 设置光标位置
-    frame.set_cursor_position((
-        area.x + 5 + app.search_query.len() as u16,
-        area.y + 2,
-    ));
+    frame.set_cursor_position((area.x + 5 + app.search_query.len() as u16, area.y + 2));
 }
 
 /// 获取 git diff 中修改的行号

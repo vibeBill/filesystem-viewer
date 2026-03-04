@@ -1,12 +1,12 @@
-use crate::git::{GitStatusManager, FileEntry, GitStatus, DiffLineType};
+use crate::git::{DiffLineType, FileEntry, GitStatus, GitStatusManager};
+use anyhow::Result;
+use crossterm::event::{MouseButton, MouseEventKind};
+use notify::{RecursiveMode, Watcher};
+use ratatui::layout::Rect;
+use std::collections::{HashMap, HashSet};
+use std::path::Path;
 use std::sync::mpsc;
 use std::time::Duration;
-use notify::{Watcher, RecursiveMode};
-use anyhow::Result;
-use std::path::Path;
-use std::collections::{HashSet, HashMap};
-use crossterm::event::{MouseButton, MouseEventKind};
-use ratatui::layout::Rect;
 
 /// 应用状态
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -18,23 +18,23 @@ pub enum AppState {
 /// 应用模式（包括搜索等特殊模式）
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum AppMode {
-    Normal,     // 正常模式
-    Search,     // 搜索模式
+    Normal, // 正常模式
+    Search, // 搜索模式
 }
 
 /// 聚焦区域
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum FocusArea {
-    Tree,    // 左侧目录树
-    Editor,  // 右侧编辑器
+    Tree,   // 左侧目录树
+    Editor, // 右侧编辑器
 }
 
 /// 文件显示模式
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum DisplayMode {
-    All,        // 显示所有文件
-    Changed,    // 只显示变更文件
-    Tracked,    // 只显示已跟踪文件
+    All,     // 显示所有文件
+    Changed, // 只显示变更文件
+    Tracked, // 只显示已跟踪文件
 }
 
 /// 应用数据
@@ -44,7 +44,9 @@ pub struct App {
     /// 文件列表（完整）
     pub files: Vec<FileEntry>,
     /// 缓存的过滤文件列表（避免重复计算）
-    cached_filtered: Vec<String>,  // 存储路径
+    cached_filtered: Vec<String>, // 存储路径
+    /// 路径到 files 下标的索引缓存（避免 O(n) 查找）
+    file_index: HashMap<String, usize>,
     /// 当前选中的文件索引（在过滤后的列表中）
     pub selected: usize,
     /// 滚动偏移
@@ -123,6 +125,7 @@ impl App {
             working_dir,
             files: Vec::new(),
             cached_filtered: Vec::new(),
+            file_index: HashMap::new(),
             selected: 0,
             scroll_offset: 0,
             state: AppState::Running,
@@ -182,6 +185,7 @@ impl App {
         match self.git_manager.get_status() {
             Ok(files) => {
                 self.files = files;
+                self.rebuild_file_index();
                 self.error_message = None;
                 // 刷新缓存
                 self.update_cached_filtered();
@@ -199,24 +203,35 @@ impl App {
         Ok(())
     }
 
+    fn rebuild_file_index(&mut self) {
+        self.file_index.clear();
+        self.file_index.reserve(self.files.len());
+        for (idx, file) in self.files.iter().enumerate() {
+            self.file_index.insert(file.path.clone(), idx);
+        }
+    }
+
+    pub fn get_file_by_path(&self, path: &str) -> Option<&FileEntry> {
+        self.file_index
+            .get(path)
+            .and_then(|&idx| self.files.get(idx))
+    }
+
     /// 更新缓存的过滤文件列表
     fn update_cached_filtered(&mut self) {
-        let files: Vec<&FileEntry> = match self.display_mode {
-            DisplayMode::All => self.files.iter().collect(),
-            DisplayMode::Changed => {
-                self.files.iter()
-                    .filter(|f| f.status != GitStatus::Clean && f.status != GitStatus::Ignored)
-                    .collect()
-            }
-            DisplayMode::Tracked => {
-                self.files.iter()
-                    .filter(|f| f.status != GitStatus::Untracked)
-                    .collect()
-            }
-        };
+        let mut sorted: Vec<&FileEntry> = self
+            .files
+            .iter()
+            .filter(|f| match self.display_mode {
+                DisplayMode::All => true,
+                DisplayMode::Changed => {
+                    f.status != GitStatus::Clean && f.status != GitStatus::Ignored
+                }
+                DisplayMode::Tracked => f.status != GitStatus::Untracked,
+            })
+            .collect();
 
-        let mut sorted: Vec<&FileEntry> = files;
-        sorted.sort_by(|a, b| a.path.cmp(&b.path));
+        sorted.sort_unstable_by(|a, b| a.path.cmp(&b.path));
 
         self.cached_filtered = sorted
             .into_iter()
@@ -232,11 +247,9 @@ impl App {
 
     /// 根据索引获取文件
     pub fn get_file_by_index(&self, index: usize) -> Option<&FileEntry> {
-        if let Some(path) = self.cached_filtered.get(index) {
-            self.files.iter().find(|f| f.path == *path)
-        } else {
-            None
-        }
+        self.cached_filtered
+            .get(index)
+            .and_then(|path| self.get_file_by_path(path))
     }
 
     /// 检查是否需要刷新
@@ -446,8 +459,7 @@ impl App {
 
             let file_path = file.path.clone();
             let full_path = Path::new(&self.working_dir).join(&file_path);
-            let content = std::fs::read_to_string(&full_path)
-                .unwrap_or_else(|_| String::new());
+            let content = std::fs::read_to_string(&full_path).unwrap_or_else(|_| String::new());
 
             self.editor_path = full_path.to_string_lossy().to_string();
             self.editor_content = content.lines().map(|s| s.to_string()).collect();
@@ -740,8 +752,10 @@ impl App {
             MouseEventKind::Down(MouseButton::Left) => {
                 // 检查是否点击在编辑器区域
                 if let Some(editor_area) = self.editor_area {
-                    if column >= editor_area.x && column < editor_area.x + editor_area.width
-                        && row >= editor_area.y && row < editor_area.y + editor_area.height
+                    if column >= editor_area.x
+                        && column < editor_area.x + editor_area.width
+                        && row >= editor_area.y
+                        && row < editor_area.y + editor_area.height
                     {
                         // 点击在编辑器上
                         self.focus = FocusArea::Editor;
@@ -833,14 +847,19 @@ impl App {
             // 检查行
             if row >= editor_area.y + 1 && row < editor_area.y + editor_area.height - 1 {
                 let line_offset = (row - (editor_area.y + 1)) as usize;
-                let new_line = (self.editor_scroll + line_offset).min(self.editor_content.len().saturating_sub(1));
+                let new_line = (self.editor_scroll + line_offset)
+                    .min(self.editor_content.len().saturating_sub(1));
                 self.editor_cursor.0 = new_line;
 
                 // 计算列：减去边框(1) + gutter(1) + 行号区(4) + 空格(1)
                 let text_start_x = editor_area.x + 7;
                 if column >= text_start_x {
                     let col_offset = (column - text_start_x) as usize;
-                    let line_len = self.editor_content.get(new_line).map(|s| s.chars().count()).unwrap_or(0);
+                    let line_len = self
+                        .editor_content
+                        .get(new_line)
+                        .map(|s| s.chars().count())
+                        .unwrap_or(0);
                     self.editor_cursor.1 = col_offset.min(line_len);
                 } else {
                     self.editor_cursor.1 = 0;
@@ -877,13 +896,12 @@ impl FileWatcher {
         let path = Path::new(path).to_path_buf();
 
         // 使用 notify 的事件 watcher
-        let mut watcher = notify::recommended_watcher(
-            move |res: Result<notify::Event, notify::Error>| {
+        let mut watcher =
+            notify::recommended_watcher(move |res: Result<notify::Event, notify::Error>| {
                 if let Ok(_) = res {
                     let _ = tx.send(());
                 }
-            }
-        )?;
+            })?;
 
         watcher.watch(&path, RecursiveMode::Recursive)?;
         Ok(())
