@@ -1231,11 +1231,7 @@ fn start_pty_shell_session(
     let child_result = {
         #[cfg(not(target_os = "windows"))]
         {
-            let mut shell_cmd = String::from(program);
-            for arg in &args {
-                shell_cmd.push(' ');
-                shell_cmd.push_str(arg);
-            }
+            let shell_cmd = build_shell_command(program, &args);
 
             Command::new("script")
                 .args(["-q", "-c", &shell_cmd, "/dev/null"])
@@ -1443,6 +1439,26 @@ fn open_in_browser(url: &str) -> Result<()> {
     }
 }
 
+fn shell_escape(arg: &str) -> String {
+    if arg
+        .chars()
+        .all(|c| c.is_ascii_alphanumeric() || "-._/:".contains(c))
+    {
+        return arg.to_string();
+    }
+
+    format!("'{}'", arg.replace('\'', "'\\''"))
+}
+
+fn build_shell_command(program: &str, args: &[String]) -> String {
+    let mut cmd = shell_escape(program);
+    for arg in args {
+        cmd.push(' ');
+        cmd.push_str(&shell_escape(arg));
+    }
+    cmd
+}
+
 fn interactive_shell_command() -> (&'static str, Vec<String>) {
     #[cfg(target_os = "windows")]
     {
@@ -1463,7 +1479,15 @@ fn interactive_shell_command() -> (&'static str, Vec<String>) {
 
     #[cfg(not(target_os = "windows"))]
     {
-        ("bash", vec!["-i".to_string()])
+        if let Ok(shell) = std::env::var("SHELL") {
+            let shell = Box::leak(shell.into_boxed_str());
+            if shell.ends_with("fish") {
+                return (shell, vec!["-i".to_string()]);
+            }
+            return (shell, vec!["-i".to_string(), "-l".to_string()]);
+        }
+
+        ("bash", vec!["-i".to_string(), "-l".to_string()])
     }
 }
 
@@ -1495,6 +1519,19 @@ mod tests {
         assert!(tab.running_pid.is_some());
 
         let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn build_shell_command_quotes_arguments() {
+        let cmd = build_shell_command("/bin/bash", &["-i".to_string(), "-l".to_string()]);
+        assert_eq!(cmd, "/bin/bash -i -l");
+
+        let cmd_with_space = build_shell_command(
+            "/path with space/bash",
+            &["-c".to_string(), "echo hello".to_string()],
+        );
+        assert!(cmd_with_space.contains("'/path with space/bash'"));
+        assert!(cmd_with_space.contains("'echo hello'"));
     }
 
     #[test]
