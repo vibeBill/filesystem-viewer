@@ -4,10 +4,11 @@ use crossterm::event::{KeyModifiers, MouseButton, MouseEventKind};
 use notify::{RecursiveMode, Watcher};
 use ratatui::layout::Rect;
 use std::collections::{HashMap, HashSet};
-use std::io::{BufRead, BufReader};
+use std::io::{BufRead, BufReader, Write};
 use std::path::Path;
-use std::process::{Command, Stdio};
+use std::process::{ChildStdin, Command, Stdio};
 use std::sync::mpsc;
+use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::Duration;
 
@@ -150,6 +151,8 @@ pub struct App {
     terminal_result_tx: std::sync::mpsc::Sender<TerminalCommandResult>,
     /// 后台终端命令结果接收端
     terminal_result_rx: std::sync::mpsc::Receiver<TerminalCommandResult>,
+    /// 每个终端 tab 对应的 PTY 写入器
+    terminal_writers: HashMap<usize, Arc<Mutex<ChildStdin>>>,
 }
 
 impl App {
@@ -204,6 +207,7 @@ impl App {
             terminal_scroll: 0,
             terminal_result_tx,
             terminal_result_rx,
+            terminal_writers: HashMap::new(),
         };
 
         // 初始刷新
@@ -216,6 +220,8 @@ impl App {
             }
         }
         app.update_cached_filtered();
+
+        app.start_terminal_session(0);
 
         Ok(app)
     }
@@ -716,12 +722,43 @@ impl App {
         self.terminal_tabs.push(TerminalTab::new(&tab_name));
         self.active_terminal_tab = self.terminal_tabs.len().saturating_sub(1);
         self.terminal_scroll = 0;
+        self.start_terminal_session(self.active_terminal_tab);
+    }
+
+    fn start_terminal_session(&mut self, tab_index: usize) {
+        if self.terminal_writers.contains_key(&tab_index) {
+            return;
+        }
+
+        let Some(tab) = self.terminal_tabs.get_mut(tab_index) else {
+            return;
+        };
+
+        let working_dir = self.working_dir.clone();
+        let sender = self.terminal_result_tx.clone();
+
+        match start_pty_shell_session(&working_dir, tab_index, sender) {
+            Ok((pid, writer)) => {
+                tab.running_pid = Some(pid);
+                tab.output.push(format!(
+                    "[PTY 会话已启动 pid={}]（输入命令后回车执行）",
+                    pid
+                ));
+                self.terminal_writers.insert(tab_index, writer);
+            }
+            Err(err) => {
+                tab.output.push(format!("[错误] 启动 PTY 失败：{}", err));
+            }
+        }
+
+        self.terminal_scroll = tab.output.len().saturating_sub(1);
     }
 
     pub fn next_terminal_tab(&mut self) {
         if !self.terminal_tabs.is_empty() {
             self.active_terminal_tab = (self.active_terminal_tab + 1) % self.terminal_tabs.len();
             self.terminal_scroll = 0;
+            self.start_terminal_session(self.active_terminal_tab);
         }
     }
 
@@ -733,6 +770,7 @@ impl App {
                 self.active_terminal_tab - 1
             };
             self.terminal_scroll = 0;
+            self.start_terminal_session(self.active_terminal_tab);
         }
     }
 
@@ -750,31 +788,45 @@ impl App {
 
     pub fn terminal_execute(&mut self) {
         let tab_index = self.active_terminal_tab;
+        self.start_terminal_session(tab_index);
+
         let Some(tab) = self.terminal_tabs.get_mut(tab_index) else {
             return;
         };
 
-        if tab.running_pid.is_some() {
-            tab.output
-                .push("[提示] 当前 Tab 已有命令在运行，先按 Ctrl+C 结束。".to_string());
-            self.terminal_scroll = tab.output.len().saturating_sub(1);
-            return;
-        }
+        let command_text = tab.input.clone();
+        tab.input.clear();
 
-        let command_text = tab.input.trim().to_string();
         if command_text.is_empty() {
             return;
         }
 
         tab.output.push(format!("> {}", command_text));
-        tab.input.clear();
-        self.terminal_scroll = tab.output.len().saturating_sub(1);
 
-        let working_dir = self.working_dir.clone();
-        let sender = self.terminal_result_tx.clone();
-        thread::spawn(move || {
-            run_shell_command_streaming(&working_dir, &command_text, tab_index, &sender);
-        });
+        let Some(writer) = self.terminal_writers.get(&tab_index).cloned() else {
+            tab.output.push("[错误] PTY 写入器不可用。".to_string());
+            self.terminal_scroll = tab.output.len().saturating_sub(1);
+            return;
+        };
+
+        let write_result = writer
+            .lock()
+            .map_err(|_| anyhow::anyhow!("PTY 写入器锁已损坏"))
+            .and_then(|mut guard| {
+                guard.write_all(command_text.as_bytes())?;
+                guard.write_all(
+                    b"
+",
+                )?;
+                guard.flush()?;
+                Ok(())
+            });
+
+        if let Err(err) = write_result {
+            tab.output.push(format!("[错误] 发送命令失败：{}", err));
+        }
+
+        self.terminal_scroll = tab.output.len().saturating_sub(1);
     }
 
     pub fn poll_terminal_output(&mut self) {
@@ -788,11 +840,16 @@ impl App {
                     tab.running_pid = Some(pid);
                     tab.output.push(format!("[进程已启动 pid={}]", pid));
                 }
-                TerminalCommandEvent::Line(line) => tab.output.push(line),
+                TerminalCommandEvent::Line(line) => {
+                    for line in strip_ansi_control_sequences(&line).lines() {
+                        tab.output.push(line.to_string());
+                    }
+                }
                 TerminalCommandEvent::Error(err) => tab.output.push(format!("[错误] {}", err)),
                 TerminalCommandEvent::Finished => {
                     tab.running_pid = None;
-                    tab.output.push(String::new());
+                    self.terminal_writers.remove(&result.tab_index);
+                    tab.output.push("[PTY 会话已结束]".to_string());
                 }
             }
 
@@ -828,18 +885,32 @@ impl App {
             return;
         };
 
-        let Some(pid) = tab.running_pid else {
-            tab.output.push("[提示] 当前没有运行中的命令。".to_string());
+        let Some(writer) = self
+            .terminal_writers
+            .get(&self.active_terminal_tab)
+            .cloned()
+        else {
+            tab.output
+                .push("[提示] 当前没有可中断的 PTY 会话。".to_string());
             self.terminal_scroll = tab.output.len().saturating_sub(1);
             return;
         };
 
-        match interrupt_process(pid) {
-            Ok(()) => tab
-                .output
-                .push(format!("^C (已发送中断信号到 pid={})", pid)),
-            Err(err) => tab.output.push(format!("[错误] 发送中断失败：{}", err)),
+        let result = writer
+            .lock()
+            .map_err(|_| anyhow::anyhow!("PTY 写入器锁已损坏"))
+            .and_then(|mut guard| {
+                guard.write_all(&[3])?;
+                guard.flush()?;
+                Ok(())
+            });
+
+        match result {
+            Ok(()) => tab.output.push("^C (已发送到 PTY 会话)".to_string()),
+            Err(err) => tab.output.push(format!("[错误] 发送 Ctrl+C 失败：{}", err)),
         }
+
+        tab.input.clear();
         self.terminal_scroll = tab.output.len().saturating_sub(1);
     }
 
@@ -1150,34 +1221,50 @@ fn send_terminal_event(
     let _ = sender.send(TerminalCommandResult { tab_index, event });
 }
 
-fn run_shell_command_streaming(
+fn start_pty_shell_session(
     working_dir: &str,
-    command: &str,
     tab_index: usize,
-    sender: &std::sync::mpsc::Sender<TerminalCommandResult>,
-) {
-    let (program, args) = shell_command(command);
-    let child_result = Command::new(program)
-        .args(args)
-        .current_dir(working_dir)
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn();
+    sender: std::sync::mpsc::Sender<TerminalCommandResult>,
+) -> Result<(u32, Arc<Mutex<ChildStdin>>)> {
+    let (program, args) = interactive_shell_command();
 
-    let mut child = match child_result {
-        Ok(child) => child,
-        Err(err) => {
-            send_terminal_event(
-                sender,
-                tab_index,
-                TerminalCommandEvent::Error(err.to_string()),
-            );
-            send_terminal_event(sender, tab_index, TerminalCommandEvent::Finished);
-            return;
+    let child_result = {
+        #[cfg(not(target_os = "windows"))]
+        {
+            let mut shell_cmd = String::from(program);
+            for arg in &args {
+                shell_cmd.push(' ');
+                shell_cmd.push_str(arg);
+            }
+
+            Command::new("script")
+                .args(["-q", "/dev/null", "-c", &shell_cmd])
+                .current_dir(working_dir)
+                .stdin(Stdio::piped())
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped())
+                .spawn()
+        }
+
+        #[cfg(target_os = "windows")]
+        {
+            Command::new(program)
+                .args(args)
+                .current_dir(working_dir)
+                .stdin(Stdio::piped())
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped())
+                .spawn()
         }
     };
 
-    send_terminal_event(sender, tab_index, TerminalCommandEvent::Started(child.id()));
+    let mut child = child_result?;
+    let pid = child.id();
+    let Some(stdin) = child.stdin.take() else {
+        return Err(anyhow::anyhow!("无法获取 PTY stdin"));
+    };
+
+    send_terminal_event(&sender, tab_index, TerminalCommandEvent::Started(pid));
 
     let stdout = child.stdout.take();
     let stderr = child.stderr.take();
@@ -1186,11 +1273,9 @@ fn run_shell_command_streaming(
 
     let stdout_thread = stdout.map(|stdout| {
         thread::spawn(move || {
-            let mut has_output = false;
             for line in BufReader::new(stdout).lines() {
                 match line {
                     Ok(line) => {
-                        has_output = true;
                         send_terminal_event(
                             &sender_stdout,
                             tab_index,
@@ -1201,23 +1286,20 @@ fn run_shell_command_streaming(
                         send_terminal_event(
                             &sender_stdout,
                             tab_index,
-                            TerminalCommandEvent::Error(format!("读取 stdout 失败：{}", err)),
+                            TerminalCommandEvent::Error(format!("读取 PTY stdout 失败：{}", err)),
                         );
                         break;
                     }
                 }
             }
-            has_output
         })
     });
 
     let stderr_thread = stderr.map(|stderr| {
         thread::spawn(move || {
-            let mut has_output = false;
             for line in BufReader::new(stderr).lines() {
                 match line {
                     Ok(line) => {
-                        has_output = true;
                         send_terminal_event(
                             &sender_stderr,
                             tab_index,
@@ -1228,58 +1310,77 @@ fn run_shell_command_streaming(
                         send_terminal_event(
                             &sender_stderr,
                             tab_index,
-                            TerminalCommandEvent::Error(format!("读取 stderr 失败：{}", err)),
+                            TerminalCommandEvent::Error(format!("读取 PTY stderr 失败：{}", err)),
                         );
                         break;
                     }
                 }
             }
-            has_output
         })
     });
 
-    let mut has_output = false;
-    if let Some(thread) = stdout_thread {
-        if let Ok(stdout_has_output) = thread.join() {
-            has_output |= stdout_has_output;
+    thread::spawn(move || {
+        if let Some(t) = stdout_thread {
+            let _ = t.join();
         }
-    }
-    if let Some(thread) = stderr_thread {
-        if let Ok(stderr_has_output) = thread.join() {
-            has_output |= stderr_has_output;
+        if let Some(t) = stderr_thread {
+            let _ = t.join();
         }
-    }
 
-    match child.wait() {
-        Ok(status) => {
-            if !status.success() {
-                send_terminal_event(
-                    sender,
-                    tab_index,
-                    TerminalCommandEvent::Line(format!("命令退出状态：{}", status)),
-                );
-                has_output = true;
-            }
-        }
-        Err(err) => {
+        if let Err(err) = child.wait() {
             send_terminal_event(
-                sender,
+                &sender,
                 tab_index,
-                TerminalCommandEvent::Error(err.to_string()),
+                TerminalCommandEvent::Error(format!("等待 PTY 子进程失败：{}", err)),
             );
-            has_output = true;
         }
+
+        send_terminal_event(&sender, tab_index, TerminalCommandEvent::Finished);
+    });
+
+    Ok((pid, Arc::new(Mutex::new(stdin))))
+}
+
+fn strip_ansi_control_sequences(input: &str) -> String {
+    let mut result = String::with_capacity(input.len());
+    let mut chars = input.chars().peekable();
+
+    while let Some(ch) = chars.next() {
+        if ch == '\u{1b}' {
+            match chars.peek().copied() {
+                Some('[') => {
+                    chars.next();
+                    while let Some(next) = chars.next() {
+                        if ('@'..='~').contains(&next) {
+                            break;
+                        }
+                    }
+                }
+                Some(']') => {
+                    chars.next();
+                    while let Some(next) = chars.next() {
+                        if next == '\u{7}' {
+                            break;
+                        }
+                        if next == '\u{1b}' && chars.peek() == Some(&'\\') {
+                            chars.next();
+                            break;
+                        }
+                    }
+                }
+                _ => {}
+            }
+            continue;
+        }
+
+        if ch.is_control() && ch != '\t' && ch != '\n' {
+            continue;
+        }
+
+        result.push(ch);
     }
 
-    if !has_output {
-        send_terminal_event(
-            sender,
-            tab_index,
-            TerminalCommandEvent::Line("(命令执行完成，无输出)".to_string()),
-        );
-    }
-
-    send_terminal_event(sender, tab_index, TerminalCommandEvent::Finished);
+    result
 }
 
 fn extract_links(line: &str) -> Vec<(usize, usize, String)> {
@@ -1342,25 +1443,7 @@ fn open_in_browser(url: &str) -> Result<()> {
     }
 }
 
-fn interrupt_process(pid: u32) -> Result<()> {
-    #[cfg(target_os = "windows")]
-    {
-        Command::new("taskkill")
-            .args(["/PID", &pid.to_string(), "/T"])
-            .status()?;
-        return Ok(());
-    }
-
-    #[cfg(not(target_os = "windows"))]
-    {
-        Command::new("kill")
-            .args(["-INT", &pid.to_string()])
-            .status()?;
-        return Ok(());
-    }
-}
-
-fn shell_command(command: &str) -> (&'static str, Vec<String>) {
+fn interactive_shell_command() -> (&'static str, Vec<String>) {
     #[cfg(target_os = "windows")]
     {
         let git_bash = [
@@ -1369,22 +1452,55 @@ fn shell_command(command: &str) -> (&'static str, Vec<String>) {
         ];
         for path in git_bash {
             if Path::new(path).exists() {
-                return (path, vec!["-lc".to_string(), command.to_string()]);
+                return (path, vec!["-i".to_string()]);
             }
         }
         return (
             "powershell",
-            vec![
-                "-NoProfile".to_string(),
-                "-Command".to_string(),
-                command.to_string(),
-            ],
+            vec!["-NoLogo".to_string(), "-NoProfile".to_string()],
         );
     }
 
     #[cfg(not(target_os = "windows"))]
     {
-        ("bash", vec!["-lc".to_string(), command.to_string()])
+        ("bash", vec!["-i".to_string()])
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::fs;
+    use std::path::PathBuf;
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    fn create_test_dir(name: &str) -> PathBuf {
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos();
+        let mut dir = std::env::temp_dir();
+        dir.push(format!("fsv-app-{}-{}", name, nanos));
+        fs::create_dir_all(&dir).expect("failed to create test directory");
+        dir
+    }
+
+    #[test]
+    fn app_starts_terminal_session_for_default_tab() {
+        let dir = create_test_dir("startup-pty");
+        let mut app = App::new(dir.to_string_lossy().as_ref()).expect("app should init");
+        app.poll_terminal_output();
+
+        let tab = &app.terminal_tabs[app.active_terminal_tab];
+        assert!(tab.running_pid.is_some());
+
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn strip_ansi_control_sequences_removes_clear_escape_codes() {
+        let input = "before\u{1b}[2J\u{1b}[Hafter";
+        assert_eq!(strip_ansi_control_sequences(input), "beforeafter");
     }
 }
 
