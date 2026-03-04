@@ -569,3 +569,63 @@ fn handle_editor_event(app: &mut App, key: KeyEvent) -> bool {
 
     false
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crossterm::event::KeyModifiers;
+    use std::fs;
+    use std::path::PathBuf;
+    use std::time::{Duration, SystemTime, UNIX_EPOCH};
+
+    fn create_test_dir(name: &str) -> PathBuf {
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos();
+        let mut dir = std::env::temp_dir();
+        dir.push(format!("fsv-{}-{}", name, nanos));
+        fs::create_dir_all(&dir).expect("failed to create test directory");
+        dir
+    }
+
+    #[test]
+    fn tab_in_editor_cycles_focus_to_terminal() {
+        let test_dir = create_test_dir("focus");
+        let mut app = App::new(test_dir.to_string_lossy().as_ref()).expect("app should init");
+        app.focus = FocusArea::Editor;
+
+        let key = KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE);
+        let should_quit = handle_editor_event(&mut app, key);
+
+        assert!(!should_quit);
+        assert_eq!(app.focus, FocusArea::Terminal);
+
+        let _ = fs::remove_dir_all(test_dir);
+    }
+
+    #[test]
+    fn terminal_execute_is_non_blocking_for_long_running_command() {
+        let test_dir = create_test_dir("terminal-async");
+        let mut app = App::new(test_dir.to_string_lossy().as_ref()).expect("app should init");
+
+        app.focus = FocusArea::Terminal;
+        #[cfg(target_os = "windows")]
+        {
+            app.terminal_tabs[app.active_terminal_tab].input = "Start-Sleep -Seconds 1".to_string();
+        }
+        #[cfg(not(target_os = "windows"))]
+        {
+            app.terminal_tabs[app.active_terminal_tab].input = "sleep 1".to_string();
+        }
+
+        let started = std::time::Instant::now();
+        app.terminal_execute();
+        assert!(
+            started.elapsed() < Duration::from_millis(200),
+            "terminal_execute should return quickly without blocking"
+        );
+
+        let _ = fs::remove_dir_all(test_dir);
+    }
+}
