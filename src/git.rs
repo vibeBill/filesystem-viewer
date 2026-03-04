@@ -1,20 +1,20 @@
-use std::process::Command;
-use std::path::Path;
-use std::collections::HashMap;
 use anyhow::Result;
+use std::collections::{HashMap, HashSet};
+use std::path::Path;
+use std::process::Command;
 
 /// Git 文件状态
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum GitStatus {
-    Modified,      // M - 修改
-    Added,         // A - 新增
-    Deleted,       // D - 删除
-    Untracked,     // ?? - 未跟踪
-    Renamed,       // R - 重命名
-    Copied,        // C - 复制
-    Unmerged,      // U - 未合并
-    Ignored,       // ! - 忽略
-    Clean,         // 无状态
+    Modified,  // M - 修改
+    Added,     // A - 新增
+    Deleted,   // D - 删除
+    Untracked, // ?? - 未跟踪
+    Renamed,   // R - 重命名
+    Copied,    // C - 复制
+    Unmerged,  // U - 未合并
+    Ignored,   // ! - 忽略
+    Clean,     // 无状态
 }
 
 impl GitStatus {
@@ -81,18 +81,74 @@ pub struct FileEntry {
 pub struct GitStatusManager {
     working_dir: String,
     is_git_repo: bool,
+    /// 记录已展开的目录相对路径（用于懒加载）
+    expanded_dirs: HashSet<String>,
+    /// 当前工作目录相对于仓库根的前缀（如 `src/`）
+    repo_prefix: String,
+}
+
+#[derive(Debug, Clone)]
+struct StatusEntry {
+    path: String,
+    status: GitStatus,
 }
 
 impl GitStatusManager {
     pub fn new(working_dir: &str) -> Self {
-        let is_git_repo = Path::new(working_dir)
-            .join(".git")
-            .exists();
+        let is_git_repo = Self::detect_git_repo(Path::new(working_dir));
+        let repo_prefix = if is_git_repo {
+            Self::detect_repo_prefix(Path::new(working_dir)).unwrap_or_default()
+        } else {
+            String::new()
+        };
 
         Self {
             working_dir: working_dir.to_string(),
             is_git_repo,
+            expanded_dirs: HashSet::new(),
+            repo_prefix,
         }
+    }
+
+    /// 向上遍历祖先目录查找 .git
+    fn detect_git_repo(path: &Path) -> bool {
+        Command::new("git")
+            .args(["rev-parse", "--is-inside-work-tree"])
+            .current_dir(path)
+            .output()
+            .map(|o| o.status.success())
+            .unwrap_or(false)
+    }
+
+    fn detect_repo_prefix(path: &Path) -> Option<String> {
+        let output = Command::new("git")
+            .args(["rev-parse", "--show-prefix"])
+            .current_dir(path)
+            .output()
+            .ok()?;
+
+        if !output.status.success() {
+            return None;
+        }
+
+        let prefix = String::from_utf8_lossy(&output.stdout)
+            .trim()
+            .replace('\\', "/");
+        if prefix.is_empty() {
+            return Some(String::new());
+        }
+
+        Some(format!("{}/", prefix.trim_end_matches('/')))
+    }
+
+    /// 添加展开的目录
+    pub fn expand_dir(&mut self, path: &str) {
+        self.expanded_dirs.insert(path.to_string());
+    }
+
+    /// 移除展开的目录
+    pub fn collapse_dir(&mut self, path: &str) {
+        self.expanded_dirs.remove(path);
     }
 
     /// 检查是否是 Git 仓库
@@ -115,9 +171,17 @@ impl GitStatusManager {
             return Ok(entries);
         }
 
-        // 获取 Git 状态
+        // VSCode 类似策略：仅请求当前目录（pathspec = .）下状态，减少大仓库扫描开销。
         let output = Command::new("git")
-            .args(["status", "--porcelain", "-u", "--renames"])
+            .args([
+                "status",
+                "--porcelain",
+                "-u",
+                "--ignored=matching",
+                "--renames",
+                "--",
+                ".",
+            ])
             .current_dir(&self.working_dir)
             .output()?;
 
@@ -126,82 +190,153 @@ impl GitStatusManager {
             anyhow::bail!("Git 命令失败：{}", stderr);
         }
 
-        // 构建 Git 状态映射
         let mut git_status_map: HashMap<String, GitStatus> = HashMap::new();
         let stdout = String::from_utf8_lossy(&output.stdout);
+        let mut status_entries = Vec::new();
 
         for line in stdout.lines() {
-            if line.len() < 4 {
-                continue;
+            if let Some(parsed) = Self::parse_status_line(line) {
+                if let Some(path) = self.normalize_status_path(&parsed.path) {
+                    git_status_map.insert(path.clone(), parsed.status);
+                    status_entries.push(StatusEntry {
+                        path,
+                        status: parsed.status,
+                    });
+                }
             }
-
-            let status_code = &line[0..2];
-            let file_path = line[3..].trim_matches('"').to_string(); // 处理带引号的路径
-
-            if file_path.is_empty() {
-                continue;
-            }
-
-            let status = GitStatus::from_code(status_code);
-            git_status_map.insert(file_path, status);
         }
 
-        // 更新文件条目的 Git 状态
+        // 更新已扫描节点的状态
         for entry in &mut entries {
             if let Some(&status) = git_status_map.get(&entry.path) {
                 entry.status = status;
             }
         }
 
-        // 核心优化：传播状态到父目录
+        // 关键修复：即使子目录未展开，也把 git 输出中的子路径状态向已显示父目录提升。
+        self.apply_status_from_git_paths(&mut entries, &status_entries);
         self.propagate_statuses(&mut entries);
 
         Ok(entries)
     }
 
-    /// 核心逻辑：将子目录/文件的状态传播到父目录
-    fn propagate_statuses(&self, entries: &mut Vec<FileEntry>) {
-        let mut path_to_status: HashMap<String, GitStatus> = HashMap::new();
-
-        // 1. 收集所有已有状态
-        for entry in entries.iter() {
-            if entry.status != GitStatus::Clean {
-                path_to_status.insert(entry.path.clone(), entry.status);
-            }
+    fn parse_status_line(line: &str) -> Option<StatusEntry> {
+        if line.len() < 4 {
+            return None;
         }
 
-        // 2. 向上迭代传播
-        let mut updates = Vec::new();
-        for (path, status) in path_to_status.iter() {
-            let mut current_path = Path::new(path);
-            while let Some(parent) = current_path.parent() {
-                let parent_str = parent.to_string_lossy().replace('\\', "/");
-                if parent_str.is_empty() || parent_str == "." {
+        let status_code = &line[0..2];
+        let mut file_path = line[3..].trim().to_string();
+
+        // 重命名/复制格式：old -> new，使用 new 路径。
+        if let Some((_, new_path)) = file_path.rsplit_once(" -> ") {
+            file_path = new_path.to_string();
+        }
+
+        let file_path = file_path
+            .trim_matches('"')
+            .trim_end_matches('/')
+            .to_string();
+
+        if file_path.is_empty() {
+            return None;
+        }
+
+        Some(StatusEntry {
+            path: file_path,
+            status: GitStatus::from_code(status_code),
+        })
+    }
+
+    fn normalize_status_path(&self, path: &str) -> Option<String> {
+        let normalized = path.replace('\\', "/");
+
+        if self.repo_prefix.is_empty() {
+            return Some(normalized.trim_start_matches("./").to_string());
+        }
+
+        if normalized == self.repo_prefix.trim_end_matches('/') {
+            return None;
+        }
+
+        normalized
+            .strip_prefix(&self.repo_prefix)
+            .map(|p| p.trim_start_matches("./").to_string())
+    }
+
+    fn apply_status_from_git_paths(&self, entries: &mut [FileEntry], statuses: &[StatusEntry]) {
+        let mut path_index: HashMap<String, usize> = HashMap::new();
+        for (idx, entry) in entries.iter().enumerate() {
+            path_index.insert(entry.path.clone(), idx);
+        }
+
+        for status_entry in statuses {
+            if status_entry.status == GitStatus::Ignored {
+                continue;
+            }
+
+            let mut current = Path::new(&status_entry.path);
+            while let Some(parent) = current.parent() {
+                let parent_path = parent.to_string_lossy();
+                if parent_path.is_empty() || parent_path == "." {
                     break;
                 }
-                updates.push((parent_str.clone(), *status));
-                current_path = parent;
+
+                if let Some(&idx) = path_index.get(parent_path.as_ref()) {
+                    if entries[idx].status.priority() < status_entry.status.priority() {
+                        entries[idx].status = status_entry.status;
+                    }
+                }
+
+                current = parent;
+            }
+        }
+    }
+
+    /// 核心逻辑：将子目录/文件的状态传播到父目录
+    fn propagate_statuses(&self, entries: &mut Vec<FileEntry>) {
+        use std::collections::HashMap;
+
+        // children 关系：parent -> Vec<child_index>
+        let mut children_map: HashMap<String, Vec<usize>> = HashMap::new();
+
+        for (i, entry) in entries.iter().enumerate() {
+            if let Some(parent) = std::path::Path::new(&entry.path).parent() {
+                let parent_str = parent.to_string_lossy().replace('\\', "/");
+                if !parent_str.is_empty() && parent_str != "." {
+                    children_map.entry(parent_str).or_default().push(i);
+                }
             }
         }
 
-        // 3. 应用更新（按优先级）
-        let mut final_statuses: HashMap<String, GitStatus> = HashMap::new();
-        for (path, status) in updates {
-            let existing = final_statuses.entry(path).or_insert(GitStatus::Clean);
-            if status.priority() > existing.priority() {
-                *existing = status;
-            }
-        }
+        // 按 depth 从深到浅排序 index
+        let mut indices: Vec<usize> = (0..entries.len()).collect();
+        indices.sort_by_key(|&i| std::cmp::Reverse(entries[i].depth));
 
-        // 4. 写回 entries
-        for entry in entries.iter_mut() {
-            if entry.is_dir {
-                if let Some(&status) = final_statuses.get(&entry.path) {
-                    if status.priority() > entry.status.priority() {
-                        entry.status = status;
+        // 目录聚合状态
+        for i in indices {
+            if !entries[i].is_dir {
+                continue;
+            }
+
+            let mut strongest_status = entries[i].status;
+
+            if let Some(children) = children_map.get(&entries[i].path) {
+                for &child_idx in children {
+                    let child_status = entries[child_idx].status;
+
+                    // 🚨 Ignored 不向上传播
+                    if child_status == GitStatus::Ignored {
+                        continue;
+                    }
+
+                    if child_status.priority() > strongest_status.priority() {
+                        strongest_status = child_status;
                     }
                 }
             }
+
+            entries[i].status = strongest_status;
         }
     }
 
@@ -213,29 +348,35 @@ impl GitStatusManager {
     }
 
     /// 递归收集所有文件
-    fn collect_all_files(&self, dir: &Path, depth: usize, entries: &mut Vec<FileEntry>) -> Result<()> {
-        // 跳过 .git 和其他大目录，优化性能
-        if dir.file_name()
+    fn collect_all_files(
+        &self,
+        dir: &Path,
+        depth: usize,
+        entries: &mut Vec<FileEntry>,
+    ) -> Result<()> {
+        // 仅跳过 .git 内部目录
+        if dir
+            .file_name()
             .and_then(|n| n.to_str())
-            .map(|n| n == ".git" || n == "node_modules" || n == "target" || n == ".idea" || n == ".vscode")
+            .map(|n| n == ".git")
             .unwrap_or(false)
         {
             return Ok(());
         }
 
         if let Ok(read_dir) = std::fs::read_dir(dir) {
-            let mut dir_entries: Vec<_> = read_dir
-                .filter_map(|e| e.ok())
-                .collect();
+            let mut dir_entries: Vec<_> = read_dir.filter_map(|e| e.ok()).collect();
 
             // 目录优先排序
             dir_entries.sort_by(|a, b| {
-                let a_is_dir = a.path().is_dir();
-                let b_is_dir = b.path().is_dir();
+                let a_path = a.path();
+                let b_path = b.path();
+                let a_is_dir = a_path.is_dir();
+                let b_is_dir = b_path.is_dir();
                 match (a_is_dir, b_is_dir) {
                     (true, false) => std::cmp::Ordering::Less,
                     (false, true) => std::cmp::Ordering::Greater,
-                    _ => a.path().file_name().cmp(&b.path().file_name()),
+                    _ => a_path.file_name().cmp(&b_path.file_name()),
                 }
             });
 
@@ -247,8 +388,8 @@ impl GitStatusManager {
                     .unwrap_or("")
                     .to_string();
 
-                // 跳过隐藏文件
-                if file_name.starts_with('.') && file_name != ".gitignore" {
+                // 仅跳过 .git 目录本身
+                if file_name == ".git" {
                     continue;
                 }
 
@@ -257,19 +398,23 @@ impl GitStatusManager {
                     .map(|p| p.to_string_lossy().replace('\\', "/"))
                     .unwrap_or_else(|_| path.to_string_lossy().replace('\\', "/"));
 
-                let relative_path = relative_path.trim_start_matches('/').to_string();
-                if relative_path.is_empty() { continue; }
+                let relative_path_str = relative_path.trim_start_matches('/').to_string();
+                if relative_path_str.is_empty() {
+                    continue;
+                }
 
                 let is_dir = path.is_dir();
 
                 entries.push(FileEntry {
-                    path: relative_path,
+                    path: relative_path_str.clone(),
                     status: GitStatus::Clean,
                     is_dir,
                     depth,
                 });
 
-                if is_dir {
+                // 性能优化：目录懒加载
+                // 只有根目录下的直接子项，或者是已被展开的目录，才继续递归扫描
+                if is_dir && (depth == 0 || self.expanded_dirs.contains(&relative_path_str)) {
                     self.collect_all_files(&path, depth + 1, entries)?;
                 }
             }
@@ -277,15 +422,87 @@ impl GitStatusManager {
         Ok(())
     }
 
-    /// 获取未跟踪的文件（在非 Git 仓库中使用）- 已弃用，逻辑已整合到 get_status
-    fn _get_untracked_files(&self) -> Result<Vec<FileEntry>> {
-        let mut entries = Vec::new();
-        self.collect_all_files(Path::new(&self.working_dir), 0, &mut entries)?;
-        for entry in &mut entries {
-            entry.status = GitStatus::Untracked;
+    /// 获取文件级别的 diff 行信息（用于 VSCode 风格 gutter 标记）
+    pub fn get_file_diff_lines(&self, file_path: &str) -> HashMap<usize, DiffLineType> {
+        let mut result = HashMap::new();
+
+        if !self.is_git_repo {
+            return result;
         }
-        Ok(entries)
+
+        let output = Command::new("git")
+            .args(["diff", "--unified=0", "--no-color", "--", file_path])
+            .current_dir(&self.working_dir)
+            .output();
+
+        if let Ok(output) = output {
+            let stdout = String::from_utf8_lossy(&output.stdout);
+            for line in stdout.lines() {
+                if line.starts_with("@@") {
+                    // 解析 @@ -old_start,old_count +new_start,new_count @@
+                    let parts: Vec<&str> = line.split("@@").collect();
+                    if parts.len() < 2 {
+                        continue;
+                    }
+
+                    let range_info = parts[1].trim();
+                    let mut old_count: usize = 0;
+                    let mut new_start: usize = 0;
+                    let mut new_count: usize = 0;
+
+                    // 解析 -old_start,old_count
+                    if let Some(old_part) = range_info.split('+').next() {
+                        let old_part = old_part.trim().trim_start_matches('-');
+                        let old_parts: Vec<&str> = old_part.split(',').collect();
+                        old_count = old_parts
+                            .get(1)
+                            .and_then(|s| s.trim().parse().ok())
+                            .unwrap_or(1);
+                    }
+
+                    // 解析 +new_start,new_count
+                    if let Some(new_part) = range_info.split('+').nth(1) {
+                        let new_parts: Vec<&str> = new_part.trim().split(',').collect();
+                        new_start = new_parts
+                            .first()
+                            .and_then(|s| s.trim().parse().ok())
+                            .unwrap_or(0);
+                        new_count = new_parts
+                            .get(1)
+                            .and_then(|s| s.trim().parse().ok())
+                            .unwrap_or(1);
+                    }
+
+                    if new_count == 0 && old_count > 0 {
+                        // 纯删除：在 new_start 行标记删除
+                        if new_start > 0 {
+                            result.insert(new_start, DiffLineType::Deleted);
+                        }
+                    } else if old_count == 0 && new_count > 0 {
+                        // 纯新增
+                        for i in 0..new_count {
+                            result.insert(new_start + i, DiffLineType::Added);
+                        }
+                    } else {
+                        // 修改（有删有增）
+                        for i in 0..new_count {
+                            result.insert(new_start + i, DiffLineType::Modified);
+                        }
+                    }
+                }
+            }
+        }
+
+        result
     }
+}
+
+/// Diff 行类型（用于 gutter 标记）
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum DiffLineType {
+    Added,    // 新增行
+    Modified, // 修改行
+    Deleted,  // 删除行标记
 }
 
 #[cfg(test)]
@@ -294,10 +511,34 @@ mod tests {
 
     #[test]
     fn test_git_status_from_code() {
-        assert_eq!(GitStatus::from_code("M"), GitStatus::Modified);
+        assert_eq!(GitStatus::from_code(" M"), GitStatus::Modified);
         assert_eq!(GitStatus::from_code("A "), GitStatus::Added);
         assert_eq!(GitStatus::from_code("??"), GitStatus::Untracked);
         assert_eq!(GitStatus::from_code("D "), GitStatus::Deleted);
+    }
+
+    #[test]
+    fn test_parse_status_line_rename() {
+        let parsed =
+            GitStatusManager::parse_status_line("R  old/file.txt -> new/file.txt").unwrap();
+        assert_eq!(parsed.path, "new/file.txt");
+        assert_eq!(parsed.status, GitStatus::Renamed);
+    }
+
+    #[test]
+    fn test_normalize_status_path_with_prefix() {
+        let mgr = GitStatusManager {
+            working_dir: String::new(),
+            is_git_repo: true,
+            expanded_dirs: HashSet::new(),
+            repo_prefix: "src/".to_string(),
+        };
+
+        assert_eq!(
+            mgr.normalize_status_path("src/main.rs"),
+            Some("main.rs".to_string())
+        );
+        assert_eq!(mgr.normalize_status_path("other/main.rs"), None);
     }
 
     #[test]

@@ -1,12 +1,12 @@
-use crate::git::{GitStatusManager, FileEntry, GitStatus};
+use crate::git::{DiffLineType, FileEntry, GitStatus, GitStatusManager};
+use anyhow::Result;
+use crossterm::event::{MouseButton, MouseEventKind};
+use notify::{RecursiveMode, Watcher};
+use ratatui::layout::Rect;
+use std::collections::{HashMap, HashSet};
+use std::path::Path;
 use std::sync::mpsc;
 use std::time::Duration;
-use notify::{Watcher, RecursiveMode};
-use anyhow::Result;
-use std::path::Path;
-use std::collections::HashSet;
-use crossterm::event::{MouseButton, MouseEventKind};
-use ratatui::layout::Rect;
 
 /// 应用状态
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -18,23 +18,23 @@ pub enum AppState {
 /// 应用模式（包括搜索等特殊模式）
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum AppMode {
-    Normal,     // 正常模式
-    Search,     // 搜索模式
+    Normal, // 正常模式
+    Search, // 搜索模式
 }
 
 /// 聚焦区域
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum FocusArea {
-    Tree,    // 左侧目录树
-    Editor,  // 右侧编辑器
+    Tree,   // 左侧目录树
+    Editor, // 右侧编辑器
 }
 
 /// 文件显示模式
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum DisplayMode {
-    All,        // 显示所有文件
-    Changed,    // 只显示变更文件
-    Tracked,    // 只显示已跟踪文件
+    All,     // 显示所有文件
+    Changed, // 只显示变更文件
+    Tracked, // 只显示已跟踪文件
 }
 
 /// 应用数据
@@ -44,7 +44,9 @@ pub struct App {
     /// 文件列表（完整）
     pub files: Vec<FileEntry>,
     /// 缓存的过滤文件列表（避免重复计算）
-    cached_filtered: Vec<String>,  // 存储路径
+    cached_filtered: Vec<String>, // 存储路径
+    /// 路径到 files 下标的索引缓存（避免 O(n) 查找）
+    file_index: HashMap<String, usize>,
     /// 当前选中的文件索引（在过滤后的列表中）
     pub selected: usize,
     /// 滚动偏移
@@ -102,6 +104,14 @@ pub struct App {
     pub mode: AppMode,
     /// 搜索查询
     pub search_query: String,
+    /// 中键拖拽起始 y 坐标
+    pub middle_drag_origin: Option<u16>,
+    /// 是否正在中键拖拽
+    pub is_middle_dragging: bool,
+    /// 编辑器 git diff 行信息（行号 -> 变更类型）
+    pub editor_diff_lines: HashMap<usize, DiffLineType>,
+    /// 编辑器水平滚动偏移（用于长行）
+    pub editor_h_scroll: usize,
 }
 
 impl App {
@@ -115,6 +125,7 @@ impl App {
             working_dir,
             files: Vec::new(),
             cached_filtered: Vec::new(),
+            file_index: HashMap::new(),
             selected: 0,
             scroll_offset: 0,
             state: AppState::Running,
@@ -144,6 +155,10 @@ impl App {
             status_message_time: None,
             mode: AppMode::Normal,
             search_query: String::new(),
+            middle_drag_origin: None,
+            is_middle_dragging: false,
+            editor_diff_lines: HashMap::new(),
+            editor_h_scroll: 0,
         };
 
         // 初始刷新
@@ -170,6 +185,7 @@ impl App {
         match self.git_manager.get_status() {
             Ok(files) => {
                 self.files = files;
+                self.rebuild_file_index();
                 self.error_message = None;
                 // 刷新缓存
                 self.update_cached_filtered();
@@ -187,24 +203,35 @@ impl App {
         Ok(())
     }
 
+    fn rebuild_file_index(&mut self) {
+        self.file_index.clear();
+        self.file_index.reserve(self.files.len());
+        for (idx, file) in self.files.iter().enumerate() {
+            self.file_index.insert(file.path.clone(), idx);
+        }
+    }
+
+    pub fn get_file_by_path(&self, path: &str) -> Option<&FileEntry> {
+        self.file_index
+            .get(path)
+            .and_then(|&idx| self.files.get(idx))
+    }
+
     /// 更新缓存的过滤文件列表
     fn update_cached_filtered(&mut self) {
-        let files: Vec<&FileEntry> = match self.display_mode {
-            DisplayMode::All => self.files.iter().collect(),
-            DisplayMode::Changed => {
-                self.files.iter()
-                    .filter(|f| f.status != GitStatus::Clean && f.status != GitStatus::Ignored)
-                    .collect()
-            }
-            DisplayMode::Tracked => {
-                self.files.iter()
-                    .filter(|f| f.status != GitStatus::Untracked)
-                    .collect()
-            }
-        };
+        let mut sorted: Vec<&FileEntry> = self
+            .files
+            .iter()
+            .filter(|f| match self.display_mode {
+                DisplayMode::All => true,
+                DisplayMode::Changed => {
+                    f.status != GitStatus::Clean && f.status != GitStatus::Ignored
+                }
+                DisplayMode::Tracked => f.status != GitStatus::Untracked,
+            })
+            .collect();
 
-        let mut sorted: Vec<&FileEntry> = files;
-        sorted.sort_by(|a, b| a.path.cmp(&b.path));
+        sorted.sort_unstable_by(|a, b| a.path.cmp(&b.path));
 
         self.cached_filtered = sorted
             .into_iter()
@@ -220,11 +247,9 @@ impl App {
 
     /// 根据索引获取文件
     pub fn get_file_by_index(&self, index: usize) -> Option<&FileEntry> {
-        if let Some(path) = self.cached_filtered.get(index) {
-            self.files.iter().find(|f| f.path == *path)
-        } else {
-            None
-        }
+        self.cached_filtered
+            .get(index)
+            .and_then(|path| self.get_file_by_path(path))
     }
 
     /// 检查是否需要刷新
@@ -265,13 +290,27 @@ impl App {
             };
 
             if !target_path.is_empty() {
+                let mut needs_refresh = false;
+
                 if self.collapsed_dirs.contains(&target_path) {
+                    // 展开目录
                     self.collapsed_dirs.remove(&target_path);
+                    self.git_manager.expand_dir(&target_path);
+                    needs_refresh = true;
                 } else {
-                    self.collapsed_dirs.insert(target_path);
+                    // 折叠目录
+                    self.collapsed_dirs.insert(target_path.clone());
+                    self.git_manager.collapse_dir(&target_path);
+                    // 折叠时不需要重新读取文件系统，直接在 UI 层面隐藏即可（也可以重新读取释放内存）
                 }
-                // 重新计算过滤列表
-                self.update_cached_filtered();
+
+                if needs_refresh {
+                    let _ = self.refresh_files();
+                } else {
+                    // 重新计算过滤列表
+                    self.update_cached_filtered();
+                }
+
                 // 调整选中索引
                 if self.selected >= self.cached_filtered.len() {
                     self.selected = self.cached_filtered.len().saturating_sub(1);
@@ -418,9 +457,9 @@ impl App {
                 return Ok(());
             }
 
-            let full_path = Path::new(&self.working_dir).join(&file.path);
-            let content = std::fs::read_to_string(&full_path)
-                .unwrap_or_else(|_| String::new());
+            let file_path = file.path.clone();
+            let full_path = Path::new(&self.working_dir).join(&file_path);
+            let content = std::fs::read_to_string(&full_path).unwrap_or_else(|_| String::new());
 
             self.editor_path = full_path.to_string_lossy().to_string();
             self.editor_content = content.lines().map(|s| s.to_string()).collect();
@@ -428,8 +467,11 @@ impl App {
             self.editor_original_content = self.editor_content.clone();
             self.editor_cursor = (0, 0);
             self.editor_scroll = 0;
+            self.editor_h_scroll = 0;
             self.editor_modified = false;
             self.editor_undo_stack.clear();
+            // 加载 git diff 行信息
+            self.editor_diff_lines = self.git_manager.get_file_diff_lines(&file_path);
             self.focus = FocusArea::Editor;
         }
         Ok(())
@@ -710,8 +752,10 @@ impl App {
             MouseEventKind::Down(MouseButton::Left) => {
                 // 检查是否点击在编辑器区域
                 if let Some(editor_area) = self.editor_area {
-                    if column >= editor_area.x && column < editor_area.x + editor_area.width
-                        && row >= editor_area.y && row < editor_area.y + editor_area.height
+                    if column >= editor_area.x
+                        && column < editor_area.x + editor_area.width
+                        && row >= editor_area.y
+                        && row < editor_area.y + editor_area.height
                     {
                         // 点击在编辑器上
                         self.focus = FocusArea::Editor;
@@ -747,19 +791,54 @@ impl App {
                     }
                 }
             }
-            // 中键点击 - 整页滚动
+            // 中键按下 - 记录起始位置，开始拖拽模式
             MouseEventKind::Down(MouseButton::Middle) => {
-                if row >= 3 {
-                    if column < self.tree_width as u16 {
-                        self.page_down();
-                    } else {
-                        self.editor_page_down();
-                    }
-                }
+                self.middle_drag_origin = Some(row);
+                self.is_middle_dragging = true;
             }
             _ => {}
         }
         false
+    }
+
+    /// 处理中键拖拽滚动
+    pub fn handle_middle_drag(&mut self, row: u16, column: u16) {
+        if !self.is_middle_dragging {
+            return;
+        }
+
+        if let Some(origin_y) = self.middle_drag_origin {
+            let delta = row as i32 - origin_y as i32;
+
+            if delta.abs() >= 1 {
+                let lines = delta.unsigned_abs() as usize;
+
+                if column < self.tree_width as u16 {
+                    // 拖拽目录树区域
+                    if delta < 0 {
+                        self.scroll_up(lines);
+                    } else {
+                        self.scroll_down(lines);
+                    }
+                } else {
+                    // 拖拽编辑器区域
+                    if delta < 0 {
+                        self.editor_scroll_up(lines);
+                    } else {
+                        self.editor_scroll_down(lines);
+                    }
+                }
+
+                // 更新起始位置
+                self.middle_drag_origin = Some(row);
+            }
+        }
+    }
+
+    /// 停止中键拖拽
+    pub fn stop_middle_drag(&mut self) {
+        self.is_middle_dragging = false;
+        self.middle_drag_origin = None;
     }
 
     /// 处理编辑器鼠标点击（设置光标位置）
@@ -768,14 +847,19 @@ impl App {
             // 检查行
             if row >= editor_area.y + 1 && row < editor_area.y + editor_area.height - 1 {
                 let line_offset = (row - (editor_area.y + 1)) as usize;
-                let new_line = (self.editor_scroll + line_offset).min(self.editor_content.len().saturating_sub(1));
+                let new_line = (self.editor_scroll + line_offset)
+                    .min(self.editor_content.len().saturating_sub(1));
                 self.editor_cursor.0 = new_line;
 
-                // 计算列：减去边框(1)和行号区(5)
-                let text_start_x = editor_area.x + 6;
+                // 计算列：减去边框(1) + gutter(1) + 行号区(4) + 空格(1)
+                let text_start_x = editor_area.x + 7;
                 if column >= text_start_x {
                     let col_offset = (column - text_start_x) as usize;
-                    let line_len = self.editor_content.get(new_line).map(|s| s.chars().count()).unwrap_or(0);
+                    let line_len = self
+                        .editor_content
+                        .get(new_line)
+                        .map(|s| s.chars().count())
+                        .unwrap_or(0);
                     self.editor_cursor.1 = col_offset.min(line_len);
                 } else {
                     self.editor_cursor.1 = 0;
@@ -812,13 +896,12 @@ impl FileWatcher {
         let path = Path::new(path).to_path_buf();
 
         // 使用 notify 的事件 watcher
-        let mut watcher = notify::recommended_watcher(
-            move |res: Result<notify::Event, notify::Error>| {
+        let mut watcher =
+            notify::recommended_watcher(move |res: Result<notify::Event, notify::Error>| {
                 if let Ok(_) = res {
                     let _ = tx.send(());
                 }
-            }
-        )?;
+            })?;
 
         watcher.watch(&path, RecursiveMode::Recursive)?;
         Ok(())
