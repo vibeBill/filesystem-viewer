@@ -72,6 +72,8 @@ fn run(
     let refresh_timeout = Duration::from_millis(16);
 
     loop {
+        app.poll_terminal_output();
+
         // 绘制界面
         terminal.draw(|frame| ui::render(frame, app))?;
 
@@ -543,9 +545,9 @@ fn handle_editor_event(app: &mut App, key: KeyEvent) -> bool {
             app.editor_insert_newline();
         }
 
-        // Tab - 切换回目录树
+        // Tab - 切换聚焦区域（编辑器 -> 终端 -> 目录树）
         KeyCode::Tab => {
-            app.exit_editor();
+            app.toggle_focus();
         }
 
         // 普通字符输入

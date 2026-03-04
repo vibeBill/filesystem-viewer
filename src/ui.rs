@@ -60,6 +60,7 @@ fn render_main_view(frame: &mut Frame, app: &mut App) {
 
     // 设置编辑器区域边界
     app.set_editor_area(main_chunks[1]);
+    app.set_terminal_area(chunks[2]);
 
     render_file_list(frame, main_chunks[0], app);
     render_editor_pane(frame, main_chunks[1], app);

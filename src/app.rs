@@ -7,6 +7,7 @@ use std::collections::{HashMap, HashSet};
 use std::path::Path;
 use std::process::Command;
 use std::sync::mpsc;
+use std::thread;
 use std::time::Duration;
 
 /// 应用状态
@@ -36,6 +37,12 @@ pub struct TerminalTab {
     pub name: String,
     pub input: String,
     pub output: Vec<String>,
+}
+
+#[derive(Debug, Clone)]
+struct TerminalCommandResult {
+    tab_index: usize,
+    output: Result<String, String>,
 }
 
 /// 文件显示模式
@@ -105,6 +112,8 @@ pub struct App {
     pub hover_col: Option<u16>,
     /// 编辑器区域边界
     pub editor_area: Option<Rect>,
+    /// 终端区域边界
+    pub terminal_area: Option<Rect>,
     /// 临时消息（保存成功等提示）
     pub status_message: Option<String>,
     /// 临时消息显示时间
@@ -127,6 +136,10 @@ pub struct App {
     pub active_terminal_tab: usize,
     /// 终端滚动偏移
     pub terminal_scroll: usize,
+    /// 后台终端命令结果发送端
+    terminal_result_tx: std::sync::mpsc::Sender<TerminalCommandResult>,
+    /// 后台终端命令结果接收端
+    terminal_result_rx: std::sync::mpsc::Receiver<TerminalCommandResult>,
 }
 
 impl App {
@@ -135,6 +148,7 @@ impl App {
         let git_manager = GitStatusManager::new(&working_dir);
 
         let (tx, rx) = mpsc::channel();
+        let (terminal_result_tx, terminal_result_rx) = mpsc::channel();
 
         let mut app = Self {
             working_dir,
@@ -166,6 +180,7 @@ impl App {
             hover_row: None,
             hover_col: None,
             editor_area: None,
+            terminal_area: None,
             status_message: None,
             status_message_time: None,
             mode: AppMode::Normal,
@@ -177,6 +192,8 @@ impl App {
             terminal_tabs: vec![TerminalTab::new("终端 1")],
             active_terminal_tab: 0,
             terminal_scroll: 0,
+            terminal_result_tx,
+            terminal_result_rx,
         };
 
         // 初始刷新
@@ -722,7 +739,8 @@ impl App {
     }
 
     pub fn terminal_execute(&mut self) {
-        let Some(tab) = self.terminal_tabs.get_mut(self.active_terminal_tab) else {
+        let tab_index = self.active_terminal_tab;
+        let Some(tab) = self.terminal_tabs.get_mut(tab_index) else {
             return;
         };
 
@@ -733,19 +751,38 @@ impl App {
 
         tab.output.push(format!("> {}", command_text));
 
-        match run_shell_command(&self.working_dir, &command_text) {
-            Ok(result) => {
-                tab.output
-                    .extend(result.lines().map(|line| line.to_string()));
-            }
-            Err(err) => {
-                tab.output.push(format!("[错误] {}", err));
-            }
-        }
-
-        tab.output.push(String::new());
+        tab.output.push("[后台执行中...]".to_string());
         tab.input.clear();
         self.terminal_scroll = tab.output.len().saturating_sub(1);
+
+        let working_dir = self.working_dir.clone();
+        let sender = self.terminal_result_tx.clone();
+        thread::spawn(move || {
+            let output = run_shell_command(&working_dir, &command_text).map_err(|e| e.to_string());
+            let _ = sender.send(TerminalCommandResult { tab_index, output });
+        });
+    }
+
+    pub fn poll_terminal_output(&mut self) {
+        while let Ok(result) = self.terminal_result_rx.try_recv() {
+            let Some(tab) = self.terminal_tabs.get_mut(result.tab_index) else {
+                continue;
+            };
+
+            match result.output {
+                Ok(output) => {
+                    tab.output
+                        .extend(output.lines().map(|line| line.to_string()));
+                }
+                Err(err) => tab.output.push(format!("[错误] {}", err)),
+            }
+
+            tab.output.push(String::new());
+
+            if self.active_terminal_tab == result.tab_index {
+                self.terminal_scroll = tab.output.len().saturating_sub(1);
+            }
+        }
     }
 
     pub fn terminal_scroll_up(&mut self, lines: usize) {
@@ -762,6 +799,11 @@ impl App {
     /// 设置编辑器区域
     pub fn set_editor_area(&mut self, area: Rect) {
         self.editor_area = Some(area);
+    }
+
+    /// 设置终端区域
+    pub fn set_terminal_area(&mut self, area: Rect) {
+        self.terminal_area = Some(area);
     }
 
     /// 整页向上滚动
@@ -854,6 +896,18 @@ impl App {
                         // 点击在编辑器上
                         self.focus = FocusArea::Editor;
                         self.editor_mouse_click(row, column);
+                        return false;
+                    }
+                }
+
+                // 检查是否点击在终端区域
+                if let Some(terminal_area) = self.terminal_area {
+                    if column >= terminal_area.x
+                        && column < terminal_area.x + terminal_area.width
+                        && row >= terminal_area.y
+                        && row < terminal_area.y + terminal_area.height
+                    {
+                        self.focus = FocusArea::Terminal;
                         return false;
                     }
                 }
