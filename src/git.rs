@@ -83,6 +83,8 @@ pub struct GitStatusManager {
     is_git_repo: bool,
     /// 记录已展开的目录相对路径（用于懒加载）
     expanded_dirs: HashSet<String>,
+    /// 当前工作目录相对于仓库根的前缀（如 `src/`）
+    repo_prefix: String,
 }
 
 #[derive(Debug, Clone)]
@@ -94,11 +96,17 @@ struct StatusEntry {
 impl GitStatusManager {
     pub fn new(working_dir: &str) -> Self {
         let is_git_repo = Self::detect_git_repo(Path::new(working_dir));
+        let repo_prefix = if is_git_repo {
+            Self::detect_repo_prefix(Path::new(working_dir)).unwrap_or_default()
+        } else {
+            String::new()
+        };
 
         Self {
             working_dir: working_dir.to_string(),
             is_git_repo,
             expanded_dirs: HashSet::new(),
+            repo_prefix,
         }
     }
 
@@ -110,6 +118,27 @@ impl GitStatusManager {
             .output()
             .map(|o| o.status.success())
             .unwrap_or(false)
+    }
+
+    fn detect_repo_prefix(path: &Path) -> Option<String> {
+        let output = Command::new("git")
+            .args(["rev-parse", "--show-prefix"])
+            .current_dir(path)
+            .output()
+            .ok()?;
+
+        if !output.status.success() {
+            return None;
+        }
+
+        let prefix = String::from_utf8_lossy(&output.stdout)
+            .trim()
+            .replace('\\', "/");
+        if prefix.is_empty() {
+            return Some(String::new());
+        }
+
+        Some(format!("{}/", prefix.trim_end_matches('/')))
     }
 
     /// 添加展开的目录
@@ -167,8 +196,13 @@ impl GitStatusManager {
 
         for line in stdout.lines() {
             if let Some(parsed) = Self::parse_status_line(line) {
-                git_status_map.insert(parsed.path.clone(), parsed.status);
-                status_entries.push(parsed);
+                if let Some(path) = self.normalize_status_path(&parsed.path) {
+                    git_status_map.insert(path.clone(), parsed.status);
+                    status_entries.push(StatusEntry {
+                        path,
+                        status: parsed.status,
+                    });
+                }
             }
         }
 
@@ -212,6 +246,22 @@ impl GitStatusManager {
             path: file_path,
             status: GitStatus::from_code(status_code),
         })
+    }
+
+    fn normalize_status_path(&self, path: &str) -> Option<String> {
+        let normalized = path.replace('\\', "/");
+
+        if self.repo_prefix.is_empty() {
+            return Some(normalized.trim_start_matches("./").to_string());
+        }
+
+        if normalized == self.repo_prefix.trim_end_matches('/') {
+            return None;
+        }
+
+        normalized
+            .strip_prefix(&self.repo_prefix)
+            .map(|p| p.trim_start_matches("./").to_string())
     }
 
     fn apply_status_from_git_paths(&self, entries: &mut [FileEntry], statuses: &[StatusEntry]) {
@@ -473,6 +523,22 @@ mod tests {
             GitStatusManager::parse_status_line("R  old/file.txt -> new/file.txt").unwrap();
         assert_eq!(parsed.path, "new/file.txt");
         assert_eq!(parsed.status, GitStatus::Renamed);
+    }
+
+    #[test]
+    fn test_normalize_status_path_with_prefix() {
+        let mgr = GitStatusManager {
+            working_dir: String::new(),
+            is_git_repo: true,
+            expanded_dirs: HashSet::new(),
+            repo_prefix: "src/".to_string(),
+        };
+
+        assert_eq!(
+            mgr.normalize_status_path("src/main.rs"),
+            Some("main.rs".to_string())
+        );
+        assert_eq!(mgr.normalize_status_path("other/main.rs"), None);
     }
 
     #[test]
