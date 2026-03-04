@@ -5,6 +5,7 @@ use notify::{RecursiveMode, Watcher};
 use ratatui::layout::Rect;
 use std::collections::{HashMap, HashSet};
 use std::path::Path;
+use std::process::Command;
 use std::sync::mpsc;
 use std::time::Duration;
 
@@ -25,8 +26,16 @@ pub enum AppMode {
 /// 聚焦区域
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum FocusArea {
-    Tree,   // 左侧目录树
-    Editor, // 右侧编辑器
+    Tree,     // 左侧目录树
+    Editor,   // 右侧编辑器
+    Terminal, // 底部终端
+}
+
+#[derive(Debug, Clone)]
+pub struct TerminalTab {
+    pub name: String,
+    pub input: String,
+    pub output: Vec<String>,
 }
 
 /// 文件显示模式
@@ -112,6 +121,12 @@ pub struct App {
     pub editor_diff_lines: HashMap<usize, DiffLineType>,
     /// 编辑器水平滚动偏移（用于长行）
     pub editor_h_scroll: usize,
+    /// 终端 tabs
+    pub terminal_tabs: Vec<TerminalTab>,
+    /// 当前终端 tab 下标
+    pub active_terminal_tab: usize,
+    /// 终端滚动偏移
+    pub terminal_scroll: usize,
 }
 
 impl App {
@@ -159,6 +174,9 @@ impl App {
             is_middle_dragging: false,
             editor_diff_lines: HashMap::new(),
             editor_h_scroll: 0,
+            terminal_tabs: vec![TerminalTab::new("终端 1")],
+            active_terminal_tab: 0,
+            terminal_scroll: 0,
         };
 
         // 初始刷新
@@ -661,8 +679,84 @@ impl App {
     pub fn toggle_focus(&mut self) {
         self.focus = match self.focus {
             FocusArea::Tree => FocusArea::Editor,
-            FocusArea::Editor => FocusArea::Tree,
+            FocusArea::Editor => FocusArea::Terminal,
+            FocusArea::Terminal => FocusArea::Tree,
         };
+    }
+
+    pub fn create_terminal_tab(&mut self) {
+        let tab_name = format!("终端 {}", self.terminal_tabs.len() + 1);
+        self.terminal_tabs.push(TerminalTab::new(&tab_name));
+        self.active_terminal_tab = self.terminal_tabs.len().saturating_sub(1);
+        self.terminal_scroll = 0;
+    }
+
+    pub fn next_terminal_tab(&mut self) {
+        if !self.terminal_tabs.is_empty() {
+            self.active_terminal_tab = (self.active_terminal_tab + 1) % self.terminal_tabs.len();
+            self.terminal_scroll = 0;
+        }
+    }
+
+    pub fn prev_terminal_tab(&mut self) {
+        if !self.terminal_tabs.is_empty() {
+            self.active_terminal_tab = if self.active_terminal_tab == 0 {
+                self.terminal_tabs.len() - 1
+            } else {
+                self.active_terminal_tab - 1
+            };
+            self.terminal_scroll = 0;
+        }
+    }
+
+    pub fn terminal_input_char(&mut self, c: char) {
+        if let Some(tab) = self.terminal_tabs.get_mut(self.active_terminal_tab) {
+            tab.input.push(c);
+        }
+    }
+
+    pub fn terminal_backspace(&mut self) {
+        if let Some(tab) = self.terminal_tabs.get_mut(self.active_terminal_tab) {
+            tab.input.pop();
+        }
+    }
+
+    pub fn terminal_execute(&mut self) {
+        let Some(tab) = self.terminal_tabs.get_mut(self.active_terminal_tab) else {
+            return;
+        };
+
+        let command_text = tab.input.trim().to_string();
+        if command_text.is_empty() {
+            return;
+        }
+
+        tab.output.push(format!("> {}", command_text));
+
+        match run_shell_command(&self.working_dir, &command_text) {
+            Ok(result) => {
+                tab.output
+                    .extend(result.lines().map(|line| line.to_string()));
+            }
+            Err(err) => {
+                tab.output.push(format!("[错误] {}", err));
+            }
+        }
+
+        tab.output.push(String::new());
+        tab.input.clear();
+        self.terminal_scroll = tab.output.len().saturating_sub(1);
+    }
+
+    pub fn terminal_scroll_up(&mut self, lines: usize) {
+        self.terminal_scroll = self.terminal_scroll.saturating_sub(lines);
+    }
+
+    pub fn terminal_scroll_down(&mut self, lines: usize) {
+        if let Some(tab) = self.terminal_tabs.get(self.active_terminal_tab) {
+            let max_scroll = tab.output.len().saturating_sub(1);
+            self.terminal_scroll = (self.terminal_scroll + lines).min(max_scroll);
+        }
     }
 
     /// 设置编辑器区域
@@ -866,6 +960,86 @@ impl App {
                 }
             }
         }
+    }
+}
+
+impl TerminalTab {
+    fn new(name: &str) -> Self {
+        let mut output = vec![
+            "欢迎使用内置终端。".to_string(),
+            "可执行示例：pnpm run dev / codex / claude / git status".to_string(),
+        ];
+        output.push(String::new());
+
+        Self {
+            name: name.to_string(),
+            input: String::new(),
+            output,
+        }
+    }
+}
+
+fn run_shell_command(working_dir: &str, command: &str) -> Result<String> {
+    let (program, args) = shell_command(command);
+    let output = Command::new(program)
+        .args(args)
+        .current_dir(working_dir)
+        .output()?;
+
+    let stdout = String::from_utf8_lossy(&output.stdout).to_string();
+    let stderr = String::from_utf8_lossy(&output.stderr).to_string();
+    let mut merged = String::new();
+
+    if !stdout.is_empty() {
+        merged.push_str(&stdout);
+        if !merged.ends_with('\n') {
+            merged.push('\n');
+        }
+    }
+
+    if !stderr.is_empty() {
+        merged.push_str(&stderr);
+        if !merged.ends_with('\n') {
+            merged.push('\n');
+        }
+    }
+
+    if !output.status.success() {
+        merged.push_str(&format!("命令退出状态：{}\n", output.status));
+    }
+
+    if merged.is_empty() {
+        merged.push_str("(命令执行完成，无输出)");
+    }
+
+    Ok(merged)
+}
+
+fn shell_command(command: &str) -> (&'static str, Vec<String>) {
+    #[cfg(target_os = "windows")]
+    {
+        let git_bash = [
+            "C:/Program Files/Git/bin/bash.exe",
+            "C:/Program Files (x86)/Git/bin/bash.exe",
+        ];
+        for path in git_bash {
+            if Path::new(path).exists() {
+                return (path, vec!["-lc".to_string(), command.to_string()]);
+            }
+        }
+        return (
+            "powershell",
+            vec![
+                "-NoProfile".to_string(),
+                "-Command".to_string(),
+                command.to_string(),
+            ],
+        );
+    }
+
+    #[cfg(not(target_os = "windows"))]
+    {
+        ("bash", vec!["-lc".to_string(), command.to_string()])
     }
 }
 

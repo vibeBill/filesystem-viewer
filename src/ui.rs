@@ -36,9 +36,10 @@ fn render_main_view(frame: &mut Frame, app: &mut App) {
     let chunks = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
-            Constraint::Length(3), // 头部
-            Constraint::Min(0),    // 主内容
-            Constraint::Length(3), // 状态栏
+            Constraint::Length(3),  // 头部
+            Constraint::Min(0),     // 文件/编辑器
+            Constraint::Length(10), // 终端
+            Constraint::Length(3),  // 状态栏
         ])
         .split(frame.area());
 
@@ -61,8 +62,9 @@ fn render_main_view(frame: &mut Frame, app: &mut App) {
     app.set_editor_area(main_chunks[1]);
 
     render_file_list(frame, main_chunks[0], app);
-    render_editor_pane(frame, main_chunks[1], app); // 直接渲染编辑器窗格
-    render_status_bar(frame, chunks[2], app);
+    render_editor_pane(frame, main_chunks[1], app);
+    render_terminal_pane(frame, chunks[2], app);
+    render_status_bar(frame, chunks[3], app);
 
     // 如果显示搜索，覆盖显示搜索框
     if app.mode == AppMode::Search {
@@ -241,6 +243,56 @@ fn render_file_list(frame: &mut Frame, area: Rect, app: &App) {
     frame.render_widget(list, area);
 }
 
+fn render_terminal_pane(frame: &mut Frame, area: Rect, app: &App) {
+    let Some(tab) = app.terminal_tabs.get(app.active_terminal_tab) else {
+        return;
+    };
+
+    let tabs = app
+        .terminal_tabs
+        .iter()
+        .enumerate()
+        .map(|(idx, t)| {
+            if idx == app.active_terminal_tab {
+                format!("[{}]", t.name)
+            } else {
+                t.name.clone()
+            }
+        })
+        .collect::<Vec<_>>()
+        .join(" | ");
+
+    let inner_height = area.height.saturating_sub(3) as usize;
+    let visible = tab
+        .output
+        .iter()
+        .skip(
+            app.terminal_scroll
+                .saturating_sub(inner_height.saturating_sub(1)),
+        )
+        .take(inner_height.saturating_sub(1))
+        .map(|line| Line::from(line.as_str()))
+        .collect::<Vec<_>>();
+
+    let mut lines = visible;
+    lines.push(Line::from(format!("> {}", tab.input)).style(Style::default().fg(Color::Yellow)));
+
+    let border_color = if app.focus == FocusArea::Terminal {
+        Color::Yellow
+    } else {
+        Color::DarkGray
+    };
+
+    let terminal = Paragraph::new(lines).block(
+        Block::default()
+            .title(format!(" 终端 {} ", tabs))
+            .borders(Borders::ALL)
+            .border_style(Style::default().fg(border_color)),
+    );
+
+    frame.render_widget(terminal, area);
+}
+
 /// 渲染状态栏
 fn render_status_bar(frame: &mut Frame, area: Rect, app: &App) {
     let stats = app.get_stats();
@@ -281,7 +333,8 @@ fn render_status_bar(frame: &mut Frame, area: Rect, app: &App) {
 
     let shortcuts_text = match app.focus {
         FocusArea::Tree => "Tab 切换 | Enter 编辑 | q 退出 | ? 帮助",
-        FocusArea::Editor => "Ctrl+S 保存 | Esc 返回 | q 保存返回",
+        FocusArea::Editor => "Ctrl+S 保存 | Esc 返回 | Tab 到终端",
+        FocusArea::Terminal => "Enter 执行 | Ctrl+T 新建tab | Ctrl+←/→ 切换tab",
     };
 
     // 计算各部分位置
@@ -595,7 +648,7 @@ fn render_help(frame: &mut Frame) {
         Line::from(" │ "),
         Line::from(" │  Enter    打开文件/折叠目录  m         切换显示模式"),
         Line::from(" │  r        手动刷新          0-9       设置刷新间隔 (秒)"),
-        Line::from(" │  Ctrl+P   搜索文件          Tab       切换到编辑器"),
+        Line::from(" │  Ctrl+P   搜索文件          Tab       循环切换焦点"),
         Line::from(""),
         Line::from(" │ 编辑器操作 (右侧) - VSCode 风格 "),
         Line::from(" │ "),
@@ -620,6 +673,12 @@ fn render_help(frame: &mut Frame) {
         Line::from(" │ Diff 高亮 "),
         Line::from(" │ "),
         Line::from(" │  绿色行号/背景  表示修改的行"),
+        Line::from(""),
+        Line::from(" │ 终端操作 (底部) "),
+        Line::from(" │ "),
+        Line::from(" │  Enter    执行命令          Ctrl+T    新建终端 Tab"),
+        Line::from(" │  Ctrl+←   上一个 Tab        Ctrl+→    下一个 Tab"),
+        Line::from(" │  Esc      返回目录树"),
         Line::from(""),
         Line::from(" │ 其他 "),
         Line::from(" │ "),

@@ -156,6 +156,8 @@ fn handle_mouse_event(app: &mut App, mouse: MouseEvent) -> bool {
         MouseEventKind::ScrollUp => {
             if app.focus == FocusArea::Editor && !app.editor_content.is_empty() {
                 app.editor_scroll_up(2);
+            } else if app.focus == FocusArea::Terminal {
+                app.terminal_scroll_up(2);
             } else {
                 app.scroll_up(2);
             }
@@ -163,6 +165,8 @@ fn handle_mouse_event(app: &mut App, mouse: MouseEvent) -> bool {
         MouseEventKind::ScrollDown => {
             if app.focus == FocusArea::Editor && !app.editor_content.is_empty() {
                 app.editor_scroll_down(2);
+            } else if app.focus == FocusArea::Terminal {
+                app.terminal_scroll_down(2);
             } else {
                 app.scroll_down(2);
             }
@@ -224,6 +228,9 @@ fn handle_key_event(app: &mut App, key: KeyEvent) -> bool {
         }
         FocusArea::Tree => {
             return handle_tree_event(app, key);
+        }
+        FocusArea::Terminal => {
+            return handle_terminal_event(app, key);
         }
     }
 }
@@ -353,6 +360,43 @@ fn handle_tree_event(app: &mut App, key: KeyEvent) -> bool {
             }
         }
 
+        _ => {}
+    }
+
+    false
+}
+
+/// 处理终端模式的事件
+fn handle_terminal_event(app: &mut App, key: KeyEvent) -> bool {
+    match key.code {
+        KeyCode::Esc => app.focus = FocusArea::Tree,
+        KeyCode::Enter => app.terminal_execute(),
+        KeyCode::Backspace => app.terminal_backspace(),
+        KeyCode::Tab => app.toggle_focus(),
+        KeyCode::Up => app.terminal_scroll_up(1),
+        KeyCode::Down => app.terminal_scroll_down(1),
+        KeyCode::Left
+            if key
+                .modifiers
+                .contains(crossterm::event::KeyModifiers::CONTROL) =>
+        {
+            app.prev_terminal_tab();
+        }
+        KeyCode::Right
+            if key
+                .modifiers
+                .contains(crossterm::event::KeyModifiers::CONTROL) =>
+        {
+            app.next_terminal_tab();
+        }
+        KeyCode::Char('t')
+            if key
+                .modifiers
+                .contains(crossterm::event::KeyModifiers::CONTROL) =>
+        {
+            app.create_terminal_tab();
+        }
+        KeyCode::Char(c) => app.terminal_input_char(c),
         _ => {}
     }
 
