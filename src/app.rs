@@ -1231,7 +1231,7 @@ fn start_pty_shell_session(
     let child_result = {
         #[cfg(not(target_os = "windows"))]
         {
-            let shell_cmd = build_shell_command(program, &args);
+            let shell_cmd = build_shell_command(&program, &args);
 
             Command::new("script")
                 .args(["-q", "-c", &shell_cmd, "/dev/null"])
@@ -1244,7 +1244,7 @@ fn start_pty_shell_session(
 
         #[cfg(target_os = "windows")]
         {
-            Command::new(program)
+            Command::new(&program)
                 .args(args)
                 .current_dir(working_dir)
                 .stdin(Stdio::piped())
@@ -1459,7 +1459,7 @@ fn build_shell_command(program: &str, args: &[String]) -> String {
     cmd
 }
 
-fn interactive_shell_command() -> (&'static str, Vec<String>) {
+fn interactive_shell_command() -> (String, Vec<String>) {
     #[cfg(target_os = "windows")]
     {
         let git_bash = [
@@ -1468,11 +1468,11 @@ fn interactive_shell_command() -> (&'static str, Vec<String>) {
         ];
         for path in git_bash {
             if Path::new(path).exists() {
-                return (path, vec!["-i".to_string()]);
+                return (path.to_string(), vec!["-i".to_string()]);
             }
         }
         return (
-            "powershell",
+            "powershell".to_string(),
             vec!["-NoLogo".to_string(), "-NoProfile".to_string()],
         );
     }
@@ -1480,14 +1480,13 @@ fn interactive_shell_command() -> (&'static str, Vec<String>) {
     #[cfg(not(target_os = "windows"))]
     {
         if let Ok(shell) = std::env::var("SHELL") {
-            let shell = Box::leak(shell.into_boxed_str());
             if shell.ends_with("fish") {
                 return (shell, vec!["-i".to_string()]);
             }
             return (shell, vec!["-i".to_string(), "-l".to_string()]);
         }
 
-        ("bash", vec!["-i".to_string(), "-l".to_string()])
+        ("bash".to_string(), vec!["-i".to_string(), "-l".to_string()])
     }
 }
 

@@ -233,6 +233,7 @@ dependencies = [
  "crossterm",
  "notify",
  "ratatui",
+ "signal-hook",
  "unicode-width 0.2.0",
 ]
 

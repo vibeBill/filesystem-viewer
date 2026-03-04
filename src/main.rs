@@ -12,6 +12,7 @@ use crossterm::{
     terminal::{disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen},
 };
 use ratatui::prelude::*;
+use signal_hook::consts::signal::SIGINT;
 use std::io;
 use std::time::Duration;
 
@@ -20,6 +21,10 @@ fn main() -> Result<()> {
     // 获取工作目录，默认为当前目录
     let args: Vec<String> = std::env::args().collect();
     let working_dir = if args.len() > 1 { &args[1] } else { "." };
+
+    // 忽略进程级 SIGINT，避免在终端面板按 Ctrl+C 直接退出应用
+    // SAFETY: handler is an empty function used only to consume SIGINT and prevent process termination.
+    let _ = unsafe { signal_hook::low_level::register(SIGINT, || {}) };
 
     // 初始化终端
     enable_raw_mode()?;

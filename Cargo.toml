@@ -19,6 +19,7 @@ anyhow = "1.0"
 chrono = "0.4"
 # Unicode 宽度计算（光标定位）
 unicode-width = "0.2"
+signal-hook = "0.3"
 
 [profile.release]
 lto = true
