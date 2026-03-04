@@ -179,6 +179,7 @@ fn handle_mouse_event(app: &mut App, mouse: MouseEvent) -> bool {
                 mouse.row,
                 mouse.column,
                 MouseEventKind::Down(MouseButton::Left),
+                mouse.modifiers,
             );
         }
         // 鼠标中键点击 - 开始拖拽滚动
@@ -187,6 +188,7 @@ fn handle_mouse_event(app: &mut App, mouse: MouseEvent) -> bool {
                 mouse.row,
                 mouse.column,
                 MouseEventKind::Down(MouseButton::Middle),
+                mouse.modifiers,
             );
         }
         // 鼠标中键拖拽 - 自由滚动
@@ -397,6 +399,13 @@ fn handle_terminal_event(app: &mut App, key: KeyEvent) -> bool {
                 .contains(crossterm::event::KeyModifiers::CONTROL) =>
         {
             app.create_terminal_tab();
+        }
+        KeyCode::Char('c')
+            if key
+                .modifiers
+                .contains(crossterm::event::KeyModifiers::CONTROL) =>
+        {
+            app.terminal_interrupt();
         }
         KeyCode::Char(c) => app.terminal_input_char(c),
         _ => {}

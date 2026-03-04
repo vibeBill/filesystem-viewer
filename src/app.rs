@@ -1,6 +1,6 @@
 use crate::git::{DiffLineType, FileEntry, GitStatus, GitStatusManager};
 use anyhow::Result;
-use crossterm::event::{MouseButton, MouseEventKind};
+use crossterm::event::{KeyModifiers, MouseButton, MouseEventKind};
 use notify::{RecursiveMode, Watcher};
 use ratatui::layout::Rect;
 use std::collections::{HashMap, HashSet};
@@ -38,6 +38,7 @@ pub struct TerminalTab {
     pub name: String,
     pub input: String,
     pub output: Vec<String>,
+    pub running_pid: Option<u32>,
 }
 
 #[derive(Debug)]
@@ -48,6 +49,7 @@ struct TerminalCommandResult {
 
 #[derive(Debug)]
 enum TerminalCommandEvent {
+    Started(u32),
     Line(String),
     Finished,
     Error(String),
@@ -752,6 +754,13 @@ impl App {
             return;
         };
 
+        if tab.running_pid.is_some() {
+            tab.output
+                .push("[提示] 当前 Tab 已有命令在运行，先按 Ctrl+C 结束。".to_string());
+            self.terminal_scroll = tab.output.len().saturating_sub(1);
+            return;
+        }
+
         let command_text = tab.input.trim().to_string();
         if command_text.is_empty() {
             return;
@@ -775,9 +784,16 @@ impl App {
             };
 
             match result.event {
+                TerminalCommandEvent::Started(pid) => {
+                    tab.running_pid = Some(pid);
+                    tab.output.push(format!("[进程已启动 pid={}]", pid));
+                }
                 TerminalCommandEvent::Line(line) => tab.output.push(line),
                 TerminalCommandEvent::Error(err) => tab.output.push(format!("[错误] {}", err)),
-                TerminalCommandEvent::Finished => tab.output.push(String::new()),
+                TerminalCommandEvent::Finished => {
+                    tab.running_pid = None;
+                    tab.output.push(String::new());
+                }
             }
 
             if self.active_terminal_tab == result.tab_index {
@@ -805,6 +821,84 @@ impl App {
     /// 设置终端区域
     pub fn set_terminal_area(&mut self, area: Rect) {
         self.terminal_area = Some(area);
+    }
+
+    pub fn terminal_interrupt(&mut self) {
+        let Some(tab) = self.terminal_tabs.get_mut(self.active_terminal_tab) else {
+            return;
+        };
+
+        let Some(pid) = tab.running_pid else {
+            tab.output.push("[提示] 当前没有运行中的命令。".to_string());
+            self.terminal_scroll = tab.output.len().saturating_sub(1);
+            return;
+        };
+
+        match interrupt_process(pid) {
+            Ok(()) => tab
+                .output
+                .push(format!("^C (已发送中断信号到 pid={})", pid)),
+            Err(err) => tab.output.push(format!("[错误] 发送中断失败：{}", err)),
+        }
+        self.terminal_scroll = tab.output.len().saturating_sub(1);
+    }
+
+    pub fn open_terminal_link_at(&mut self, row: u16, column: u16) -> bool {
+        let Some(area) = self.terminal_area else {
+            return false;
+        };
+
+        if area.height < 3
+            || row <= area.y
+            || row >= area.y + area.height - 1
+            || column <= area.x
+            || column >= area.x + area.width - 1
+        {
+            return false;
+        }
+
+        let Some(tab) = self.terminal_tabs.get(self.active_terminal_tab) else {
+            return false;
+        };
+
+        let inner_height = area.height.saturating_sub(3) as usize;
+        if inner_height == 0 {
+            return false;
+        }
+        let output_lines = inner_height.saturating_sub(1);
+        let start = self
+            .terminal_scroll
+            .saturating_sub(inner_height.saturating_sub(1));
+        let visible_lines = tab
+            .output
+            .iter()
+            .skip(start)
+            .take(output_lines)
+            .collect::<Vec<_>>();
+
+        let line_rel = (row - area.y - 1) as usize;
+        if line_rel >= visible_lines.len() {
+            return false;
+        }
+
+        let line = visible_lines[line_rel];
+        let col_rel = (column - area.x - 1) as usize;
+        for (start, end, url) in extract_links(line) {
+            if col_rel >= start && col_rel < end {
+                match open_in_browser(&url) {
+                    Ok(()) => {
+                        self.status_message = Some(format!("已打开链接: {}", url));
+                        self.status_message_time = Some(std::time::Instant::now());
+                    }
+                    Err(err) => {
+                        self.error_message = Some(format!("打开链接失败: {}", err));
+                    }
+                }
+                return true;
+            }
+        }
+
+        false
     }
 
     /// 整页向上滚动
@@ -879,7 +973,13 @@ impl App {
     }
 
     /// 处理鼠标点击事件
-    pub fn handle_mouse_click(&mut self, row: u16, column: u16, kind: MouseEventKind) -> bool {
+    pub fn handle_mouse_click(
+        &mut self,
+        row: u16,
+        column: u16,
+        kind: MouseEventKind,
+        modifiers: KeyModifiers,
+    ) -> bool {
         // 更新 hover 位置
         self.hover_row = Some(row);
         self.hover_col = Some(column);
@@ -887,6 +987,13 @@ impl App {
         match kind {
             // 左键点击
             MouseEventKind::Down(MouseButton::Left) => {
+                // Ctrl + 点击终端链接
+                if modifiers.contains(KeyModifiers::CONTROL)
+                    && self.open_terminal_link_at(row, column)
+                {
+                    return false;
+                }
+
                 // 检查是否点击在编辑器区域
                 if let Some(editor_area) = self.editor_area {
                     if column >= editor_area.x
@@ -1030,6 +1137,7 @@ impl TerminalTab {
             name: name.to_string(),
             input: String::new(),
             output,
+            running_pid: None,
         }
     }
 }
@@ -1068,6 +1176,8 @@ fn run_shell_command_streaming(
             return;
         }
     };
+
+    send_terminal_event(sender, tab_index, TerminalCommandEvent::Started(child.id()));
 
     let stdout = child.stdout.take();
     let stderr = child.stderr.take();
@@ -1170,6 +1280,84 @@ fn run_shell_command_streaming(
     }
 
     send_terminal_event(sender, tab_index, TerminalCommandEvent::Finished);
+}
+
+fn extract_links(line: &str) -> Vec<(usize, usize, String)> {
+    let mut result = Vec::new();
+    let mut in_token = false;
+    let mut token_start = 0usize;
+    let chars: Vec<char> = line.chars().collect();
+
+    for (idx, ch) in chars.iter().enumerate() {
+        if ch.is_whitespace() {
+            if in_token {
+                if let Some(link) = normalize_link(&line[token_start..idx]) {
+                    result.push((token_start, idx, link));
+                }
+                in_token = false;
+            }
+        } else if !in_token {
+            token_start = idx;
+            in_token = true;
+        }
+    }
+
+    if in_token {
+        if let Some(link) = normalize_link(&line[token_start..]) {
+            result.push((token_start, chars.len(), link));
+        }
+    }
+
+    result
+}
+
+fn normalize_link(token: &str) -> Option<String> {
+    let trimmed = token.trim_matches(|c: char| {
+        c == ',' || c == ';' || c == ')' || c == ']' || c == '}' || c == '"' || c == '\''
+    });
+    if trimmed.starts_with("http://") || trimmed.starts_with("https://") {
+        Some(trimmed.to_string())
+    } else {
+        None
+    }
+}
+
+fn open_in_browser(url: &str) -> Result<()> {
+    #[cfg(target_os = "windows")]
+    {
+        Command::new("cmd").args(["/C", "start", "", url]).spawn()?;
+        return Ok(());
+    }
+
+    #[cfg(target_os = "macos")]
+    {
+        Command::new("open").arg(url).spawn()?;
+        return Ok(());
+    }
+
+    #[cfg(all(unix, not(target_os = "macos")))]
+    {
+        Command::new("xdg-open").arg(url).spawn()?;
+        return Ok(());
+    }
+}
+
+fn interrupt_process(pid: u32) -> Result<()> {
+    #[cfg(target_os = "windows")]
+    {
+        Command::new("taskkill")
+            .args(["/PID", &pid.to_string(), "/T"])
+            .status()?;
+        return Ok(());
+    }
+
+    #[cfg(not(target_os = "windows"))]
+    {
+        Command::new("kill")
+            .args(["-INT", &pid.to_string()])
+            .status()?;
+        return Ok(());
+    }
 }
 
 fn shell_command(command: &str) -> (&'static str, Vec<String>) {

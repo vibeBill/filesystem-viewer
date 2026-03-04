@@ -335,7 +335,7 @@ fn render_status_bar(frame: &mut Frame, area: Rect, app: &App) {
     let shortcuts_text = match app.focus {
         FocusArea::Tree => "Tab 切换 | Enter 编辑 | q 退出 | ? 帮助",
         FocusArea::Editor => "Ctrl+S 保存 | Esc 返回 | Tab 到终端",
-        FocusArea::Terminal => "Enter 执行 | Ctrl+T 新建tab | Ctrl+←/→ 切换tab",
+        FocusArea::Terminal => "Enter 执行 | Ctrl+C 中断 | Ctrl+点击链接 打开浏览器",
     };
 
     // 计算各部分位置
@@ -679,6 +679,7 @@ fn render_help(frame: &mut Frame) {
         Line::from(" │ "),
         Line::from(" │  Enter    执行命令          Ctrl+T    新建终端 Tab"),
         Line::from(" │  Ctrl+←   上一个 Tab        Ctrl+→    下一个 Tab"),
+        Line::from(" │  Ctrl+C   中断当前命令      Ctrl+点击  打开链接"),
         Line::from(" │  Esc      返回目录树"),
         Line::from(""),
         Line::from(" │ 其他 "),
