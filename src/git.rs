@@ -1,20 +1,20 @@
-use std::process::Command;
-use std::path::Path;
-use std::collections::{HashMap, HashSet};
 use anyhow::Result;
+use std::collections::{HashMap, HashSet};
+use std::path::Path;
+use std::process::Command;
 
 /// Git 文件状态
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum GitStatus {
-    Modified,      // M - 修改
-    Added,         // A - 新增
-    Deleted,       // D - 删除
-    Untracked,     // ?? - 未跟踪
-    Renamed,       // R - 重命名
-    Copied,        // C - 复制
-    Unmerged,      // U - 未合并
-    Ignored,       // ! - 忽略
-    Clean,         // 无状态
+    Modified,  // M - 修改
+    Added,     // A - 新增
+    Deleted,   // D - 删除
+    Untracked, // ?? - 未跟踪
+    Renamed,   // R - 重命名
+    Copied,    // C - 复制
+    Unmerged,  // U - 未合并
+    Ignored,   // ! - 忽略
+    Clean,     // 无状态
 }
 
 impl GitStatus {
@@ -85,6 +85,12 @@ pub struct GitStatusManager {
     expanded_dirs: HashSet<String>,
 }
 
+#[derive(Debug, Clone)]
+struct StatusEntry {
+    path: String,
+    status: GitStatus,
+}
+
 impl GitStatusManager {
     pub fn new(working_dir: &str) -> Self {
         let is_git_repo = Self::detect_git_repo(Path::new(working_dir));
@@ -136,12 +142,17 @@ impl GitStatusManager {
             return Ok(entries);
         }
 
-        // 我们仍然直接在 working_dir 下运行 git status
-        // 这极大地提高了速度，因为它只分析当前目录及其子目录（特别是对于巨大的 git 库）
-        // 并且我们使用 --ignored=matching 而不是 --ignored
-        // 因为普通的 --ignored 会枚举出被忽略的目录如 target 下面的成千上万个文件，极其缓慢
+        // VSCode 类似策略：仅请求当前目录（pathspec = .）下状态，减少大仓库扫描开销。
         let output = Command::new("git")
-            .args(["status", "--porcelain", "-u", "--ignored=matching", "--renames", "--", "."])
+            .args([
+                "status",
+                "--porcelain",
+                "-u",
+                "--ignored=matching",
+                "--renames",
+                "--",
+                ".",
+            ])
             .current_dir(&self.working_dir)
             .output()?;
 
@@ -150,50 +161,91 @@ impl GitStatusManager {
             anyhow::bail!("Git 命令失败：{}", stderr);
         }
 
-        // 构建 Git 状态映射
         let mut git_status_map: HashMap<String, GitStatus> = HashMap::new();
         let stdout = String::from_utf8_lossy(&output.stdout);
+        let mut status_entries = Vec::new();
 
         for line in stdout.lines() {
-            if line.len() < 4 {
-                continue;
+            if let Some(parsed) = Self::parse_status_line(line) {
+                git_status_map.insert(parsed.path.clone(), parsed.status);
+                status_entries.push(parsed);
             }
-
-            let status_code = &line[0..2];
-            let file_path = line[3..].trim_matches('"').to_string(); // 处理带引号的路径
-            // 去掉尾部的 / （git 对 ignored 目录会加 /）
-            let file_path = file_path.trim_end_matches('/').to_string();
-
-            if file_path.is_empty() {
-                continue;
-            }
-
-            let status = GitStatus::from_code(status_code);
-            git_status_map.insert(file_path, status);
         }
 
-        // 更新文件条目的 Git 状态
+        // 更新已扫描节点的状态
         for entry in &mut entries {
             if let Some(&status) = git_status_map.get(&entry.path) {
                 entry.status = status;
             }
         }
 
-        // 核心优化：传播状态到父目录
+        // 关键修复：即使子目录未展开，也把 git 输出中的子路径状态向已显示父目录提升。
+        self.apply_status_from_git_paths(&mut entries, &status_entries);
         self.propagate_statuses(&mut entries);
 
         Ok(entries)
     }
 
+    fn parse_status_line(line: &str) -> Option<StatusEntry> {
+        if line.len() < 4 {
+            return None;
+        }
+
+        let status_code = &line[0..2];
+        let mut file_path = line[3..].trim().to_string();
+
+        // 重命名/复制格式：old -> new，使用 new 路径。
+        if let Some((_, new_path)) = file_path.rsplit_once(" -> ") {
+            file_path = new_path.to_string();
+        }
+
+        let file_path = file_path
+            .trim_matches('"')
+            .trim_end_matches('/')
+            .to_string();
+
+        if file_path.is_empty() {
+            return None;
+        }
+
+        Some(StatusEntry {
+            path: file_path,
+            status: GitStatus::from_code(status_code),
+        })
+    }
+
+    fn apply_status_from_git_paths(&self, entries: &mut [FileEntry], statuses: &[StatusEntry]) {
+        let mut path_index: HashMap<String, usize> = HashMap::new();
+        for (idx, entry) in entries.iter().enumerate() {
+            path_index.insert(entry.path.clone(), idx);
+        }
+
+        for status_entry in statuses {
+            if status_entry.status == GitStatus::Ignored {
+                continue;
+            }
+
+            let mut current = Path::new(&status_entry.path);
+            while let Some(parent) = current.parent() {
+                let parent_path = parent.to_string_lossy();
+                if parent_path.is_empty() || parent_path == "." {
+                    break;
+                }
+
+                if let Some(&idx) = path_index.get(parent_path.as_ref()) {
+                    if entries[idx].status.priority() < status_entry.status.priority() {
+                        entries[idx].status = status_entry.status;
+                    }
+                }
+
+                current = parent;
+            }
+        }
+    }
+
     /// 核心逻辑：将子目录/文件的状态传播到父目录
     fn propagate_statuses(&self, entries: &mut Vec<FileEntry>) {
         use std::collections::HashMap;
-
-        // path -> index（避免反复查找）
-        let mut path_index: HashMap<String, usize> = HashMap::new();
-        for (i, entry) in entries.iter().enumerate() {
-            path_index.insert(entry.path.clone(), i);
-        }
 
         // children 关系：parent -> Vec<child_index>
         let mut children_map: HashMap<String, Vec<usize>> = HashMap::new();
@@ -246,9 +298,15 @@ impl GitStatusManager {
     }
 
     /// 递归收集所有文件
-    fn collect_all_files(&self, dir: &Path, depth: usize, entries: &mut Vec<FileEntry>) -> Result<()> {
+    fn collect_all_files(
+        &self,
+        dir: &Path,
+        depth: usize,
+        entries: &mut Vec<FileEntry>,
+    ) -> Result<()> {
         // 仅跳过 .git 内部目录
-        if dir.file_name()
+        if dir
+            .file_name()
             .and_then(|n| n.to_str())
             .map(|n| n == ".git")
             .unwrap_or(false)
@@ -257,18 +315,18 @@ impl GitStatusManager {
         }
 
         if let Ok(read_dir) = std::fs::read_dir(dir) {
-            let mut dir_entries: Vec<_> = read_dir
-                .filter_map(|e| e.ok())
-                .collect();
+            let mut dir_entries: Vec<_> = read_dir.filter_map(|e| e.ok()).collect();
 
             // 目录优先排序
             dir_entries.sort_by(|a, b| {
-                let a_is_dir = a.path().is_dir();
-                let b_is_dir = b.path().is_dir();
+                let a_path = a.path();
+                let b_path = b.path();
+                let a_is_dir = a_path.is_dir();
+                let b_is_dir = b_path.is_dir();
                 match (a_is_dir, b_is_dir) {
                     (true, false) => std::cmp::Ordering::Less,
                     (false, true) => std::cmp::Ordering::Greater,
-                    _ => a.path().file_name().cmp(&b.path().file_name()),
+                    _ => a_path.file_name().cmp(&b_path.file_name()),
                 }
             });
 
@@ -291,7 +349,9 @@ impl GitStatusManager {
                     .unwrap_or_else(|_| path.to_string_lossy().replace('\\', "/"));
 
                 let relative_path_str = relative_path.trim_start_matches('/').to_string();
-                if relative_path_str.is_empty() { continue; }
+                if relative_path_str.is_empty() {
+                    continue;
+                }
 
                 let is_dir = path.is_dir();
 
@@ -331,7 +391,9 @@ impl GitStatusManager {
                 if line.starts_with("@@") {
                     // 解析 @@ -old_start,old_count +new_start,new_count @@
                     let parts: Vec<&str> = line.split("@@").collect();
-                    if parts.len() < 2 { continue; }
+                    if parts.len() < 2 {
+                        continue;
+                    }
 
                     let range_info = parts[1].trim();
                     let mut old_count: usize = 0;
@@ -342,7 +404,8 @@ impl GitStatusManager {
                     if let Some(old_part) = range_info.split('+').next() {
                         let old_part = old_part.trim().trim_start_matches('-');
                         let old_parts: Vec<&str> = old_part.split(',').collect();
-                        old_count = old_parts.get(1)
+                        old_count = old_parts
+                            .get(1)
                             .and_then(|s| s.trim().parse().ok())
                             .unwrap_or(1);
                     }
@@ -350,10 +413,12 @@ impl GitStatusManager {
                     // 解析 +new_start,new_count
                     if let Some(new_part) = range_info.split('+').nth(1) {
                         let new_parts: Vec<&str> = new_part.trim().split(',').collect();
-                        new_start = new_parts.first()
+                        new_start = new_parts
+                            .first()
                             .and_then(|s| s.trim().parse().ok())
                             .unwrap_or(0);
-                        new_count = new_parts.get(1)
+                        new_count = new_parts
+                            .get(1)
                             .and_then(|s| s.trim().parse().ok())
                             .unwrap_or(1);
                     }
@@ -385,9 +450,9 @@ impl GitStatusManager {
 /// Diff 行类型（用于 gutter 标记）
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum DiffLineType {
-    Added,     // 新增行
-    Modified,  // 修改行
-    Deleted,   // 删除行标记
+    Added,    // 新增行
+    Modified, // 修改行
+    Deleted,  // 删除行标记
 }
 
 #[cfg(test)]
@@ -396,10 +461,18 @@ mod tests {
 
     #[test]
     fn test_git_status_from_code() {
-        assert_eq!(GitStatus::from_code("M"), GitStatus::Modified);
+        assert_eq!(GitStatus::from_code(" M"), GitStatus::Modified);
         assert_eq!(GitStatus::from_code("A "), GitStatus::Added);
         assert_eq!(GitStatus::from_code("??"), GitStatus::Untracked);
         assert_eq!(GitStatus::from_code("D "), GitStatus::Deleted);
+    }
+
+    #[test]
+    fn test_parse_status_line_rename() {
+        let parsed =
+            GitStatusManager::parse_status_line("R  old/file.txt -> new/file.txt").unwrap();
+        assert_eq!(parsed.path, "new/file.txt");
+        assert_eq!(parsed.status, GitStatus::Renamed);
     }
 
     #[test]

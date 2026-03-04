@@ -1,27 +1,25 @@
-mod git;
 mod app;
+mod git;
 mod ui;
 
 use anyhow::Result;
+use app::{App, AppMode, AppState, FocusArea};
 use crossterm::{
-    event::{self, Event, KeyCode, KeyEvent, KeyEventKind, MouseButton, MouseEvent, MouseEventKind},
+    event::{
+        self, Event, KeyCode, KeyEvent, KeyEventKind, MouseButton, MouseEvent, MouseEventKind,
+    },
     execute,
     terminal::{disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen},
 };
 use ratatui::prelude::*;
 use std::io;
 use std::time::Duration;
-use app::{App, AppState, FocusArea, AppMode};
 
 /// 主函数
 fn main() -> Result<()> {
     // 获取工作目录，默认为当前目录
     let args: Vec<String> = std::env::args().collect();
-    let working_dir = if args.len() > 1 {
-        &args[1]
-    } else {
-        "."
-    };
+    let working_dir = if args.len() > 1 { &args[1] } else { "." };
 
     // 初始化终端
     enable_raw_mode()?;
@@ -50,7 +48,10 @@ fn main() -> Result<()> {
     // 恢复终端
     disable_raw_mode()?;
     execute!(terminal.backend_mut(), LeaveAlternateScreen)?;
-    execute!(terminal.backend_mut(), crossterm::event::DisableMouseCapture)?;
+    execute!(
+        terminal.backend_mut(),
+        crossterm::event::DisableMouseCapture
+    )?;
     terminal.show_cursor()?;
 
     if let Err(e) = result {
@@ -168,11 +169,19 @@ fn handle_mouse_event(app: &mut App, mouse: MouseEvent) -> bool {
         }
         // 鼠标左键点击
         MouseEventKind::Down(MouseButton::Left) => {
-            app.handle_mouse_click(mouse.row, mouse.column, MouseEventKind::Down(MouseButton::Left));
+            app.handle_mouse_click(
+                mouse.row,
+                mouse.column,
+                MouseEventKind::Down(MouseButton::Left),
+            );
         }
         // 鼠标中键点击 - 开始拖拽滚动
         MouseEventKind::Down(MouseButton::Middle) => {
-            app.handle_mouse_click(mouse.row, mouse.column, MouseEventKind::Down(MouseButton::Middle));
+            app.handle_mouse_click(
+                mouse.row,
+                mouse.column,
+                MouseEventKind::Down(MouseButton::Middle),
+            );
         }
         // 鼠标中键拖拽 - 自由滚动
         MouseEventKind::Drag(MouseButton::Middle) => {
@@ -323,12 +332,20 @@ fn handle_tree_event(app: &mut App, key: KeyEvent) -> bool {
         }
 
         // 搜索文件（按 / 键或 Ctrl+P - VSCode 风格）
-        KeyCode::Char('/') | KeyCode::Char('p') if key.modifiers.contains(crossterm::event::KeyModifiers::CONTROL) => {
+        KeyCode::Char('/') | KeyCode::Char('p')
+            if key
+                .modifiers
+                .contains(crossterm::event::KeyModifiers::CONTROL) =>
+        {
             app.toggle_search();
         }
 
         // Ctrl+O - 打开文件（VSCode 风格）
-        KeyCode::Char('o') if key.modifiers.contains(crossterm::event::KeyModifiers::CONTROL) => {
+        KeyCode::Char('o')
+            if key
+                .modifiers
+                .contains(crossterm::event::KeyModifiers::CONTROL) =>
+        {
             if let Some(file) = app.selected_file() {
                 if !file.is_dir {
                     let _ = app.open_editor();
@@ -352,31 +369,51 @@ fn handle_editor_event(app: &mut App, key: KeyEvent) -> bool {
         }
 
         // 保存（Ctrl+S - VSCode 风格）
-        KeyCode::Char('s') if key.modifiers.contains(crossterm::event::KeyModifiers::CONTROL) => {
+        KeyCode::Char('s')
+            if key
+                .modifiers
+                .contains(crossterm::event::KeyModifiers::CONTROL) =>
+        {
             if let Err(e) = app.editor_save() {
                 app.error_message = Some(format!("保存失败：{}", e));
             }
         }
 
         // 撤销（Ctrl+Z - VSCode 风格）
-        KeyCode::Char('z') if key.modifiers.contains(crossterm::event::KeyModifiers::CONTROL) => {
+        KeyCode::Char('z')
+            if key
+                .modifiers
+                .contains(crossterm::event::KeyModifiers::CONTROL) =>
+        {
             app.editor_undo();
         }
 
         // 全选（Ctrl+A - VSCode 风格）- 跳转到文件开头
-        KeyCode::Char('a') if key.modifiers.contains(crossterm::event::KeyModifiers::CONTROL) => {
+        KeyCode::Char('a')
+            if key
+                .modifiers
+                .contains(crossterm::event::KeyModifiers::CONTROL) =>
+        {
             app.editor_cursor = (0, 0);
             app.editor_scroll = 0;
         }
 
         // 跳到文件开头（Ctrl+Home - VSCode 风格）
-        KeyCode::Home if key.modifiers.contains(crossterm::event::KeyModifiers::CONTROL) => {
+        KeyCode::Home
+            if key
+                .modifiers
+                .contains(crossterm::event::KeyModifiers::CONTROL) =>
+        {
             app.editor_cursor = (0, 0);
             app.editor_scroll = 0;
         }
 
         // 跳到文件末尾（Ctrl+End - VSCode 风格）
-        KeyCode::End if key.modifiers.contains(crossterm::event::KeyModifiers::CONTROL) => {
+        KeyCode::End
+            if key
+                .modifiers
+                .contains(crossterm::event::KeyModifiers::CONTROL) =>
+        {
             if let Some(last_line) = app.editor_content.last() {
                 app.editor_cursor = (app.editor_content.len() - 1, last_line.chars().count());
             }
@@ -384,14 +421,22 @@ fn handle_editor_event(app: &mut App, key: KeyEvent) -> bool {
         }
 
         // 查找（Ctrl+F - VSCode 风格）- 暂时同搜索功能
-        KeyCode::Char('f') if key.modifiers.contains(crossterm::event::KeyModifiers::CONTROL) => {
+        KeyCode::Char('f')
+            if key
+                .modifiers
+                .contains(crossterm::event::KeyModifiers::CONTROL) =>
+        {
             // 暂时实现为搜索文件，后续可实现文件内查找
             app.exit_editor();
             app.toggle_search();
         }
 
         // 关闭编辑器（Ctrl+W - VSCode 风格）
-        KeyCode::Char('w') if key.modifiers.contains(crossterm::event::KeyModifiers::CONTROL) => {
+        KeyCode::Char('w')
+            if key
+                .modifiers
+                .contains(crossterm::event::KeyModifiers::CONTROL) =>
+        {
             let _ = app.editor_save();
             app.exit_editor();
         }
