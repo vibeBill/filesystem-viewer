@@ -4,8 +4,9 @@ use crossterm::event::{MouseButton, MouseEventKind};
 use notify::{RecursiveMode, Watcher};
 use ratatui::layout::Rect;
 use std::collections::{HashMap, HashSet};
+use std::io::{BufRead, BufReader};
 use std::path::Path;
-use std::process::Command;
+use std::process::{Command, Stdio};
 use std::sync::mpsc;
 use std::thread;
 use std::time::Duration;
@@ -39,10 +40,17 @@ pub struct TerminalTab {
     pub output: Vec<String>,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug)]
 struct TerminalCommandResult {
     tab_index: usize,
-    output: Result<String, String>,
+    event: TerminalCommandEvent,
+}
+
+#[derive(Debug)]
+enum TerminalCommandEvent {
+    Line(String),
+    Finished,
+    Error(String),
 }
 
 /// 文件显示模式
@@ -750,16 +758,13 @@ impl App {
         }
 
         tab.output.push(format!("> {}", command_text));
-
-        tab.output.push("[后台执行中...]".to_string());
         tab.input.clear();
         self.terminal_scroll = tab.output.len().saturating_sub(1);
 
         let working_dir = self.working_dir.clone();
         let sender = self.terminal_result_tx.clone();
         thread::spawn(move || {
-            let output = run_shell_command(&working_dir, &command_text).map_err(|e| e.to_string());
-            let _ = sender.send(TerminalCommandResult { tab_index, output });
+            run_shell_command_streaming(&working_dir, &command_text, tab_index, &sender);
         });
     }
 
@@ -769,15 +774,11 @@ impl App {
                 continue;
             };
 
-            match result.output {
-                Ok(output) => {
-                    tab.output
-                        .extend(output.lines().map(|line| line.to_string()));
-                }
-                Err(err) => tab.output.push(format!("[错误] {}", err)),
+            match result.event {
+                TerminalCommandEvent::Line(line) => tab.output.push(line),
+                TerminalCommandEvent::Error(err) => tab.output.push(format!("[错误] {}", err)),
+                TerminalCommandEvent::Finished => tab.output.push(String::new()),
             }
-
-            tab.output.push(String::new());
 
             if self.active_terminal_tab == result.tab_index {
                 self.terminal_scroll = tab.output.len().saturating_sub(1);
@@ -1033,40 +1034,142 @@ impl TerminalTab {
     }
 }
 
-fn run_shell_command(working_dir: &str, command: &str) -> Result<String> {
+fn send_terminal_event(
+    sender: &std::sync::mpsc::Sender<TerminalCommandResult>,
+    tab_index: usize,
+    event: TerminalCommandEvent,
+) {
+    let _ = sender.send(TerminalCommandResult { tab_index, event });
+}
+
+fn run_shell_command_streaming(
+    working_dir: &str,
+    command: &str,
+    tab_index: usize,
+    sender: &std::sync::mpsc::Sender<TerminalCommandResult>,
+) {
     let (program, args) = shell_command(command);
-    let output = Command::new(program)
+    let child_result = Command::new(program)
         .args(args)
         .current_dir(working_dir)
-        .output()?;
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn();
 
-    let stdout = String::from_utf8_lossy(&output.stdout).to_string();
-    let stderr = String::from_utf8_lossy(&output.stderr).to_string();
-    let mut merged = String::new();
+    let mut child = match child_result {
+        Ok(child) => child,
+        Err(err) => {
+            send_terminal_event(
+                sender,
+                tab_index,
+                TerminalCommandEvent::Error(err.to_string()),
+            );
+            send_terminal_event(sender, tab_index, TerminalCommandEvent::Finished);
+            return;
+        }
+    };
 
-    if !stdout.is_empty() {
-        merged.push_str(&stdout);
-        if !merged.ends_with('\n') {
-            merged.push('\n');
+    let stdout = child.stdout.take();
+    let stderr = child.stderr.take();
+    let sender_stdout = sender.clone();
+    let sender_stderr = sender.clone();
+
+    let stdout_thread = stdout.map(|stdout| {
+        thread::spawn(move || {
+            let mut has_output = false;
+            for line in BufReader::new(stdout).lines() {
+                match line {
+                    Ok(line) => {
+                        has_output = true;
+                        send_terminal_event(
+                            &sender_stdout,
+                            tab_index,
+                            TerminalCommandEvent::Line(line),
+                        );
+                    }
+                    Err(err) => {
+                        send_terminal_event(
+                            &sender_stdout,
+                            tab_index,
+                            TerminalCommandEvent::Error(format!("读取 stdout 失败：{}", err)),
+                        );
+                        break;
+                    }
+                }
+            }
+            has_output
+        })
+    });
+
+    let stderr_thread = stderr.map(|stderr| {
+        thread::spawn(move || {
+            let mut has_output = false;
+            for line in BufReader::new(stderr).lines() {
+                match line {
+                    Ok(line) => {
+                        has_output = true;
+                        send_terminal_event(
+                            &sender_stderr,
+                            tab_index,
+                            TerminalCommandEvent::Line(line),
+                        );
+                    }
+                    Err(err) => {
+                        send_terminal_event(
+                            &sender_stderr,
+                            tab_index,
+                            TerminalCommandEvent::Error(format!("读取 stderr 失败：{}", err)),
+                        );
+                        break;
+                    }
+                }
+            }
+            has_output
+        })
+    });
+
+    let mut has_output = false;
+    if let Some(thread) = stdout_thread {
+        if let Ok(stdout_has_output) = thread.join() {
+            has_output |= stdout_has_output;
+        }
+    }
+    if let Some(thread) = stderr_thread {
+        if let Ok(stderr_has_output) = thread.join() {
+            has_output |= stderr_has_output;
         }
     }
 
-    if !stderr.is_empty() {
-        merged.push_str(&stderr);
-        if !merged.ends_with('\n') {
-            merged.push('\n');
+    match child.wait() {
+        Ok(status) => {
+            if !status.success() {
+                send_terminal_event(
+                    sender,
+                    tab_index,
+                    TerminalCommandEvent::Line(format!("命令退出状态：{}", status)),
+                );
+                has_output = true;
+            }
+        }
+        Err(err) => {
+            send_terminal_event(
+                sender,
+                tab_index,
+                TerminalCommandEvent::Error(err.to_string()),
+            );
+            has_output = true;
         }
     }
 
-    if !output.status.success() {
-        merged.push_str(&format!("命令退出状态：{}\n", output.status));
+    if !has_output {
+        send_terminal_event(
+            sender,
+            tab_index,
+            TerminalCommandEvent::Line("(命令执行完成，无输出)".to_string()),
+        );
     }
 
-    if merged.is_empty() {
-        merged.push_str("(命令执行完成，无输出)");
-    }
-
-    Ok(merged)
+    send_terminal_event(sender, tab_index, TerminalCommandEvent::Finished);
 }
 
 fn shell_command(command: &str) -> (&'static str, Vec<String>) {
