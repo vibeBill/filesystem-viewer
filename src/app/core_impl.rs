@@ -68,7 +68,30 @@ impl App {
     pub fn refresh_files(&mut self) -> Result<()> {
         match self.git_manager.get_status() {
             Ok(files) => {
+                let known_dirs: HashSet<String> = self
+                    .files
+                    .iter()
+                    .filter(|f| f.is_dir)
+                    .map(|f| f.path.clone())
+                    .collect();
+
                 self.files = files;
+
+                let current_dirs: HashSet<String> = self
+                    .files
+                    .iter()
+                    .filter(|f| f.is_dir)
+                    .map(|f| f.path.clone())
+                    .collect();
+
+                // 清理失效目录，并把首次出现的目录默认标记为折叠。
+                self.collapsed_dirs.retain(|path| current_dirs.contains(path));
+                for dir in &current_dirs {
+                    if !known_dirs.contains(dir) {
+                        self.collapsed_dirs.insert(dir.clone());
+                    }
+                }
+
                 self.rebuild_file_index();
                 self.error_message = None;
                 // 刷新缓存
