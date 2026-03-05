@@ -103,7 +103,7 @@ impl App {
 
     /// 更新缓存的过滤文件列表
     fn update_cached_filtered(&mut self) {
-        let mut sorted: Vec<&FileEntry> = self
+        let filtered: Vec<&FileEntry> = self
             .files
             .iter()
             .filter(|f| match self.display_mode {
@@ -115,9 +115,9 @@ impl App {
             })
             .collect();
 
-        sorted.sort_unstable_by(|a, b| a.path.cmp(&b.path));
-
-        self.cached_filtered = sorted
+        // 保持 git/files 收集阶段的顺序：同级目录下“文件夹在前，文件在后”，且各自按名称排序。
+        // 这里不再按完整路径重排，避免破坏目录优先的展示规则。
+        self.cached_filtered = filtered
             .into_iter()
             .filter(|f| self.should_show(&f.path))
             .map(|f| f.path.clone())
